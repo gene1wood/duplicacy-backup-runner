@@ -1,0 +1,164 @@
+# duplicacy-backup-runner
+
+Runs a scheduled [Duplicacy](https://duplicacy.com/) backup and reports progress to
+[healthchecks.io](https://healthchecks.io/).
+
+For each configured backup directory, it:
+
+- Verifies every non-`.duplicacy` entry is a symlink (a real subdirectory would hide
+  its contents from Duplicacy).
+- Reads every destination from `.duplicacy/preferences` (a repository can back up to
+  more than one storage). For sftp destinations, it checks connectivity and remote
+  directory ownership to decide whether this host may prune it; each sftp entry needs
+  its own `keys.ssh_key_file`.
+- Runs `duplicacy init` against any destination missing its "chunks" directory,
+  using RSA encryption if exactly one RSA public key is found under
+  `<duplicacy_basedir>/keys` (detected by content, not filename), otherwise plain
+  password encryption. More than one candidate key is treated as a failure.
+- When there's a local destination (a bare filesystem path) plus others, backs up to
+  the local one first and replicates via the cheaper `duplicacy copy`, unless the
+  local destination is RSA-encrypted (this tool never holds the private key needed to
+  decrypt it for `copy`) — in which case it runs a full `duplicacy backup` against
+  every destination instead. RSA status is always probed via `duplicacy info -e`; 
+  if that can't be determined, the backup directory is skipped for this run.
+- Prunes each destination after its backup/copy succeeds, where pruning is permitted.
+- Logs to a per-run file, a persistent per-client log, and a "lastrun" log, and
+  reports start/failure/success/log-tail events to healthchecks.io.
+- Uploads the per-run log to the last sftp destination touched.
+
+A failure on one destination or backup directory doesn't abort the run — processing
+continues with the rest, and the final log-upload/ping always happens.
+
+## Installation
+
+```bash
+pip install duplicacy-backup-runner
+```
+
+## First-time host setup
+
+On a new client host, after `pip install duplicacy-backup-runner`, run:
+
+```bash
+duplicacy-backup-runner setup
+```
+
+This provisions `<duplicacy_basedir>`, downloads the `duplicacy` binary, walks
+you through SSH keys and sync/RSA encryption, runs `duplicacy init`, fetches
+`.duplicacy/filters`, writes/updates `config.yaml`, and installs a systemd
+timer or `/etc/cron.d` entry. Run it again to add another backup directory or
+destination to an existing setup. If the backup directory already has a
+`.duplicacy/preferences`, its default destination's storage URL, encryption,
+SSH key and password are reused rather than prompted for, and `duplicacy init`
+is skipped.
+
+## Configuration
+
+Each backup directory's `.duplicacy/preferences` file needs a `keys.ssh_key_file`
+entry for every sftp destination, and a `keys.password` entry for every encrypted
+destination — see the "Reads every destination entry" and RSA-detection bullets
+above for how those are used.
+
+`config.yaml` lives at the path shown by:
+
+```bash
+duplicacy-backup-runner --help
+```
+
+(a [platformdirs](https://pypi.org/project/platformdirs/) user config directory,
+e.g. `/root/.config/duplicacy-backup-runner/config.yaml` when run as root under
+cron/systemd), or at an explicit path passed with `--config`.
+
+You don't need to create this file yourself: `duplicacy-backup-runner setup`
+writes it, setting `healthchecks_uuid`, `client_individual_id`,
+`backup_directories`, and, where they apply, `duplicacy_basedir`,
+`known_hosts_string` and `filters_url`. Every other setting (`log_basedir`,
+`lock_file`, `rate_limit_ip`/`rate_limit_rate`, `log_level`,
+`internet_check_*`, `duplicacy_version`, `duplicacy_download_url`) is optional
+and can only be set by editing the file by hand after `setup` has run. Use
+[`config.example.yaml`](config.example.yaml) as the reference for those keys.
+
+Re-running `setup` keeps any keys you've added, but it rewrites the file, so
+comments are not preserved.
+
+Copying `config.example.yaml` into place yourself is only needed if you're
+provisioning a host by hand without `setup`, in which case you're also
+responsible for everything else `setup` does (see
+[First-time host setup](#first-time-host-setup)).
+
+## Usage
+
+```bash
+duplicacy-backup-runner [--config PATH] [--log-level LEVEL] [--log-basedir PATH] [-v] [--dry-run]
+```
+
+Install a cron job or systemd timer that runs `duplicacy-backup-runner` on your
+schedule; it takes out a lock file (`lock_file` in the config) so overlapping runs
+are skipped rather than run concurrently.
+
+### Dry run
+
+`--dry-run` shows what a run would do without changing anything:
+
+- `duplicacy backup` and `duplicacy prune` run for real with their own `-dry-run`
+  option, so you see which files would be uploaded and which snapshots pruned.
+- `duplicacy init` and `duplicacy copy`, which have no `-dry-run` option, are
+  logged but not run. A destination that would need `init` has its
+  backup/copy/prune skipped too, since there's no storage for them to run against yet.
+- Provisioning (creating directories, downloading the duplicacy binary or
+  filters, chmodding keys) is only logged.
+- Output goes to the console only; no log files are written or uploaded, no
+  healthchecks.io pings are sent, and no lock is taken.
+- Read-only checks still run: sftp connectivity, remote ownership, and
+  `duplicacy info` for RSA detection. If `known_hosts_string` differs from
+  `<duplicacy_basedir>/keys/known_hosts`, a temporary copy is used instead of
+  updating the real file.
+
+A dry run needs the duplicacy binary to already be installed. `--dry-run`
+isn't supported with `setup`.
+
+## Migrating from run-scheduled-duplicacy-backup.bash
+
+- `config.bash`'s `HC_UUID`, `CLIENT_INDIVIDUAL_ID`, `BACKUP_DIRECTORIES`,
+  `RATE_LIMIT_IP`, `RATE_LIMIT_RATE`, and `KNOWN_HOSTS_STRING` map to
+  `healthchecks_uuid`, `client_individual_id`, `backup_directories`, `rate_limit_ip`,
+  `rate_limit_rate`, and `known_hosts_string` in `config.yaml`.
+- Behavior changes from the bash version:
+  - A validation failure on one backup directory no longer aborts the whole run.
+  - `known_hosts_string`, if set, is now actually used (written to
+    `<duplicacy_basedir>/keys/known_hosts` before connecting) — the bash version
+    exported it but never used it.
+  - The bash version located one ssh identity file per host by globbing
+    `<duplicacy_basedir>/keys/id_*_<hostname>`. This version instead requires each
+    sftp entry in `.duplicacy/preferences` to carry its own `keys.ssh_key_file`,
+    so a repository can back up to multiple sftp destinations with different
+    identities.
+  - Multi-destination support (multiple storages per repository, per-destination
+    pruning, and the RSA-aware `duplicacy copy` optimization) is new in this port.
+  - Provisioning a new client host is now done with `duplicacy-backup-runner setup`.
+
+## Development
+
+```bash
+python3 -m venv ~/.virtualenvs/duplicacy-backup-runner
+source ~/.virtualenvs/duplicacy-backup-runner/bin/activate
+pip install -e ".[dev]"
+pytest
+ruff format .
+```
+
+### Integration tests
+
+`tests/test_integration.py` runs a real `duplicacy` binary end-to-end (`init`/`add`/
+`backup`/`copy`/`prune`/`info` against throwaway local storage) to verify the CLI
+flags and output parsing this tool relies on.
+
+They're skipped unless a binary is found via, in order: `DUPLICACY_TEST_BINARY`,
+`tests/bin/duplicacy` (gitignored — drop a binary there), or `duplicacy` on `PATH`.
+Get one from [the releases page](https://github.com/gilbertchen/duplicacy/releases).
+One test also needs `openssl` on `PATH` and is skipped separately if it's missing.
+
+In an environment with no real internet egress, point `internet_check_url` at a
+local server that answers 200 rather than lowering
+`internet_check_attempts`/`internet_check_delay` — that exercises the real success
+path instead of the "no internet" fallback.

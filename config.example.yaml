@@ -1,0 +1,78 @@
+# Copy to the config path shown by `duplicacy-backup-runner --help`
+# (platformdirs user config dir, e.g. /root/.config/duplicacy-backup-runner/config.yaml
+# when run as root), or point at it explicitly with --config.
+
+# Required. The healthchecks.io check UUID this run reports start/success/failure/log to.
+healthchecks_uuid: "00000000-0000-0000-0000-000000000000"
+
+# Optional. Identifies this host's persistent log file (duplicacy.<id>.txt) and
+# the healthchecks.io payloads. Defaults to the short hostname.
+# client_individual_id: my-host
+
+# Duplicacy backup directories to process, each containing a .duplicacy/ preferences
+# file. Every entry not named .duplicacy directly under a backup directory must be a
+# symlink (a real subdirectory there means symlinks inside it won't be backed up).
+#
+# A backup directory's preferences file may list more than one storage destination.
+# Each sftp destination needs its own keys.ssh_key_file entry in preferences (used
+# for this tool's own connectivity/ownership checks, separately from whatever
+# Duplicacy itself uses); an encrypted destination needs keys.password so this tool
+# can ask Duplicacy whether it's RSA-encrypted. See README.md for how multiple
+# destinations are handled.
+backup_directories:
+  - /opt/duplicacy/backup
+
+# Optional. Root of the Duplicacy install; keys/, bin/duplicacy, and the default
+# logs/ directory are resolved relative to this. If a destination is missing its
+# "chunks" directory (never initialized, or wiped), this tool runs `duplicacy init`
+# against it, using RSA encryption if it finds a file under keys/ whose content is a
+# PEM RSA public key (any filename; detected by content, not name) -- otherwise
+# plain password encryption if the destination's preferences mark it encrypted.
+# duplicacy_basedir: /opt/duplicacy
+
+# Optional. Defaults to <duplicacy_basedir>/logs.
+# log_basedir: /opt/duplicacy/logs
+
+# Optional. Path to the lock file used to prevent overlapping runs.
+# lock_file: /var/lock/duplicacy-backup
+
+# Optional. If this host has an IP address matching rate_limit_ip, duplicacy backup
+# and copy runs are throttled to rate_limit_rate (KB/s, default 32).
+# rate_limit_ip: 192.168.1.50
+# rate_limit_rate: 32
+
+# Optional. If set, written to <duplicacy_basedir>/keys/known_hosts before each run,
+# in `ssh-keyscan`/known_hosts format, so sftp connections trust the expected hosts.
+# known_hosts_string: |
+#   [example.com]:1234 ecdsa-sha2-nistp256 AAAA...
+
+# Optional. Console log level; also settable with --log-level or -v/--verbose.
+# log_level: INFO
+
+# Optional. Before backing up, and before uploading the run log, this tool makes up
+# to internet_check_attempts probes of internet_check_url, sleeping
+# internet_check_delay seconds between failures, before giving up and proceeding
+# anyway (this is best-effort and never blocks the run). In an environment with no
+# real internet egress that still allows local traffic -- a sandbox, some CI --
+# point internet_check_url at a local server that answers 200 instead of lowering
+# attempts/delay: that exercises a real successful check (no retries needed) rather
+# than just disabling it.
+# internet_check_attempts: 5
+# internet_check_delay: 5
+# internet_check_url: http://www.google.com/
+
+# Optional. Version of the duplicacy binary this tool auto-downloads to
+# <duplicacy_basedir>/bin/duplicacy if it's not already present there. Check
+# https://github.com/gilbertchen/duplicacy/releases for the current release
+# before relying on the default.
+# duplicacy_version: 3.2.5
+
+# Optional. Overrides the URL bin/duplicacy is downloaded from when missing,
+# instead of the release asset derived from duplicacy_version (Linux x64).
+# Use this for a different OS/architecture build.
+# duplicacy_download_url: https://github.com/gilbertchen/duplicacy/releases/download/v3.2.5/duplicacy_linux_x64_3.2.5
+
+# Optional. If a backup directory is missing .duplicacy/filters, and this is
+# set, it's downloaded from this URL before the next run backs it up. No
+# default -- unset means filters are never auto-populated.
+# filters_url: https://raw.githubusercontent.com/gene1wood/personal-backup-system/master/duplicacy-filters-linux.txt

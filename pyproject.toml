@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "duplicacy-backup-runner"
+version = "3.0.0"
+description = "Runs a scheduled Duplicacy backup and reports progress to healthchecks.io."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE.txt"]
+authors = [
+    { name = "Gene Wood", email = "gene_wood@public.cementhorizon.com" },
+]
+maintainers = [
+    { name = "Gene Wood", email = "gene_wood@public.cementhorizon.com" },
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "click",
+    "platformdirs",
+    "PyYAML",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+duplicacy-backup-runner = "duplicacy_backup_runner.main:main"
+
+[project.urls]
+Homepage = "https://github.com/gene1wood/duplicacy-backup-runner"
+Repository = "https://github.com/gene1wood/duplicacy-backup-runner"
+Changelog = "https://github.com/gene1wood/duplicacy-backup-runner/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/gene1wood/duplicacy-backup-runner#readme"
+Issues = "https://github.com/gene1wood/duplicacy-backup-runner/issues"
+Funding = "https://github.com/sponsors/gene1wood"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
