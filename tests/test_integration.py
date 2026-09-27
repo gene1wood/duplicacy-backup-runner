@@ -467,17 +467,22 @@ def test_main_backs_up_through_the_real_cli_entrypoint(tmp_path, local_http_serv
 def test_generate_rsa_keypair_produces_a_usable_public_key(tmp_path, monkeypatch):
     """openssl genrsa -aes256 (and the later -pubout decrypt) prompt for a
     passphrase interactively -- fine for the real setup TUI, which inherits
-    the terminal, but this test feeds it via stdin since there's no TTY
-    here."""
+    the terminal, but this test passes it with -passout/-passin instead.
+    Piping it to stdin works on Linux with no TTY, but OpenSSL on Windows
+    prompts on the console and would wait there forever."""
     real_run = subprocess.run
 
     def fake_run(args, **kwargs):
+        # Inserted right after the subcommand, since genrsa takes no
+        # options after its trailing key size
         if "genrsa" in args:
             return real_run(
-                args, input="testpassphrase\ntestpassphrase\n", text=True, **kwargs
+                [*args[:2], "-passout", "pass:testpassphrase", *args[2:]], **kwargs
             )
         if "-pubout" in args:
-            return real_run(args, input="testpassphrase\n", text=True, **kwargs)
+            return real_run(
+                [*args[:2], "-passin", "pass:testpassphrase", *args[2:]], **kwargs
+            )
         return real_run(args, **kwargs)
 
     monkeypatch.setattr(setup.subprocess, "run", fake_run)
