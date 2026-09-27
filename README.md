@@ -146,26 +146,6 @@ OpenSSH Client (`sftp.exe`, under Settings > Optional features). On Windows:
 - RSA encryption is only offered if `openssl` is on the PATH; otherwise
   password encryption is used.
 
-## Migrating from run-scheduled-duplicacy-backup.bash
-
-- `config.bash`'s `HC_UUID`, `CLIENT_INDIVIDUAL_ID`, `BACKUP_DIRECTORIES`,
-  `RATE_LIMIT_IP`, `RATE_LIMIT_RATE`, and `KNOWN_HOSTS_STRING` map to
-  `healthchecks_uuid`, `client_individual_id`, `backup_directories`, `rate_limit_ip`,
-  `rate_limit_rate`, and `known_hosts_string` in `config.yaml`.
-- Behavior changes from the bash version:
-  - A validation failure on one backup directory no longer aborts the whole run.
-  - `known_hosts_string`, if set, is now actually used (written to
-    `<duplicacy_basedir>/keys/known_hosts` before connecting) — the bash version
-    exported it but never used it.
-  - The bash version located one ssh identity file per host by globbing
-    `<duplicacy_basedir>/keys/id_*_<hostname>`. This version instead requires each
-    sftp entry in `.duplicacy/preferences` to carry its own `keys.ssh_key_file`,
-    so a repository can back up to multiple sftp destinations with different
-    identities.
-  - Multi-destination support (multiple storages per repository, per-destination
-    pruning, and the RSA-aware `duplicacy copy` optimization) is new in this port.
-  - Provisioning a new client host is now done with `duplicacy-backup-runner setup`.
-
 ## Development
 
 ```bash
@@ -198,8 +178,9 @@ The **Test** workflow (`.github/workflows/test.yml`) runs on every push to
 `main` and every pull request: ruff, plus the unit and integration tests on
 Linux against a downloaded `duplicacy` binary.
 
-The **Windows tests** workflow (`.github/workflows/windows.yml`) only runs when
-started by hand, from the Actions tab or with:
+The **Windows tests** workflow (`.github/workflows/windows.yml`) runs on the
+same triggers. It can also be started by hand on any branch, from the Actions
+tab or with:
 
 ```bash
 gh workflow run windows.yml --ref <branch>

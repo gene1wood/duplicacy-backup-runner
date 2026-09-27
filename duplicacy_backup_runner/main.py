@@ -1,7 +1,4 @@
-"""Run a scheduled Duplicacy backup, reporting progress to healthchecks.io.
-
-Python port of run-scheduled-duplicacy-backup.bash.
-"""
+"""Run a scheduled Duplicacy backup, reporting progress to healthchecks.io."""
 
 from __future__ import annotations
 

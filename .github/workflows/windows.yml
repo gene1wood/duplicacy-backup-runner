@@ -1,5 +1,6 @@
-# GitHub Actions workflow: test on Windows. Run on demand from the Actions
-# tab, or with: gh workflow run windows.yml --ref <branch>
+# GitHub Actions workflow: test on Windows. Runs on the same triggers as
+# test.yml, and can also be started by hand from the Actions tab or with:
+# gh workflow run windows.yml --ref <branch>
 #
 # The "test" job runs the unit and integration tests (the latter against a
 # real duplicacy.exe). The "end-to-end" job runs tests/test_windows_e2e.py,
@@ -11,6 +12,10 @@
 name: Windows tests
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
 
 env:

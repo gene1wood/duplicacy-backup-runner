@@ -1,6 +1,6 @@
 # GitHub Actions workflow: run the test suite on Linux, including the
 # integration tests against a real duplicacy binary. Windows is tested
-# separately, on demand, by windows.yml.
+# separately, on the same triggers, by windows.yml.
 #
 # Actions are pinned to commit hashes rather than version tags; see the
 # comment in release.yml.
