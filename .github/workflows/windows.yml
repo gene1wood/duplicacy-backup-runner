@@ -20,6 +20,7 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: windows-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -41,12 +42,15 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/gilbertchen/duplicacy/releases/download/v$env:DUPLICACY_VERSION/duplicacy_win_x64_$env:DUPLICACY_VERSION.exe" -OutFile $binary
           "DUPLICACY_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # A test that hangs is killed after --timeout seconds, dumping every
+      # thread's stack, so the log shows where it was stuck
       - name: Run tests
-        run: python -m pytest
+        run: python -m pytest -v --timeout=300
 
   end-to-end:
     name: End-to-end
     runs-on: windows-latest
+    timeout-minutes: 30
     env:
       DUPLICACY_BACKUP_RUNNER_WINDOWS_E2E: "1"
     steps:
