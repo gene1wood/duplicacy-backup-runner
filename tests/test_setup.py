@@ -219,7 +219,10 @@ def test_merge_backup_directory_into_config_appends_new_entry():
         raw_config, main.Path("/data/repo")
     )
 
-    assert result["backup_directories"] == ["/opt/duplicacy/backup", "/data/repo"]
+    assert result["backup_directories"] == [
+        "/opt/duplicacy/backup",
+        str(main.Path("/data/repo")),
+    ]
 
 
 def test_merge_backup_directory_into_config_is_idempotent_when_already_present():

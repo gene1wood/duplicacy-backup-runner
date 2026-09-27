@@ -433,9 +433,8 @@ def merge_backup_directory_into_config(
     """Adds backup_directory to raw_config's backup_directories list if it's
     not already there, rather than clobbering an existing setup."""
     directories = raw_config.setdefault("backup_directories", [])
-    entry = str(backup_directory)
-    if entry not in directories:
-        directories.append(entry)
+    if all(Path(existing) != backup_directory for existing in directories):
+        directories.append(str(backup_directory))
     return raw_config
 
 
