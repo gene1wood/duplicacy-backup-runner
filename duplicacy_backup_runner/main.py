@@ -1625,7 +1625,7 @@ def _run(
         )
         run_log_path = log_paths[0]
         run_logger = RunLogger(*log_paths, console_level)
-    run_logger.info(f"Beginning run-scheduled-duplicacy-backup version {__version__}")
+    run_logger.info(f"Beginning duplicacy-backup-runner version {__version__}")
     if config.dry_run:
         run_logger.info(
             "Dry run: nothing will be changed. duplicacy backup and prune run with "
