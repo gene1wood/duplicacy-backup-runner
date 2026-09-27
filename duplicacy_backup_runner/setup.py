@@ -166,13 +166,14 @@ def secure_key_file(key_file: Path) -> None:
     Administrators or the current user, or whose ACL grants anyone else
     access, so there this makes Administrators the owner and grants access
     only to SYSTEM (which the scheduled task runs as) and Administrators
-    (for setup, run from an elevated prompt). The owner is set first so
-    this also works on a key that's accessible only to SYSTEM."""
+    (for setup, run from an elevated prompt). Ownership is taken first,
+    with takeown since icacls /setowner needs access the key may not grant,
+    so this also works on a key that's accessible only to SYSTEM."""
     if not main.IS_WINDOWS:
         key_file.chmod(0o600)
         return
+    subprocess.run(["takeown", "/F", str(key_file), "/A"], check=True)
     icacls = ["icacls", str(key_file)]
-    subprocess.run([*icacls, "/setowner", WINDOWS_ADMINISTRATORS_SID], check=True)
     subprocess.run([*icacls, "/inheritance:r"], check=True)
     # Not checked, since the current user may have no entry to remove
     subprocess.run(

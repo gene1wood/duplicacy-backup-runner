@@ -57,16 +57,26 @@ def _openssh_loads_key(key_file: Path) -> subprocess.CompletedProcess:
 
 
 def _icacls(path: Path, *args: str) -> None:
-    subprocess.run(["icacls", str(path), *args], check=True, capture_output=True)
+    result = subprocess.run(
+        ["icacls", str(path), *args], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, f"icacls {args}:\n{result.stdout}{result.stderr}"
 
 
 def _powershell(command: str) -> str:
-    return subprocess.run(
+    # Drop PSModulePath inherited from pwsh (the Actions runner's default
+    # shell), which makes Windows PowerShell load PowerShell 7's copies of
+    # modules like Microsoft.PowerShell.Security and fail to run Get-Acl
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    result = subprocess.run(
         ["powershell", "-NoProfile", "-Command", command],
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout.strip()
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, f"{command}:\n{result.stderr}"
+    return result.stdout.strip()
 
 
 def test_secure_key_file_makes_a_readable_key_usable(tmp_path):
@@ -89,10 +99,18 @@ def test_secure_key_file_reclaims_a_system_only_key(tmp_path):
     first."""
     key_file = tmp_path / "id_ed25519_client"
     _generate_key(key_file)
-    _icacls(key_file, "/inheritance:r")
+    # Each step needs access the next one takes away: changing the owner
+    # needs WRITE_OWNER and the last ACL change WRITE_DAC, both of which
+    # this process only has through the Administrators and user entries
     _icacls(key_file, "/grant:r", "*S-1-5-18:F")
-    _icacls(key_file, "/remove:g", "*S-1-5-32-544", getpass.getuser())
     _icacls(key_file, "/setowner", "*S-1-5-18")
+    _icacls(
+        key_file,
+        "/inheritance:r",
+        "/remove:g",
+        "*S-1-5-32-544",
+        getpass.getuser(),
+    )
     assert _openssh_loads_key(key_file).returncode != 0, (
         "expected a SYSTEM-only key to be unreadable before secure_key_file"
     )

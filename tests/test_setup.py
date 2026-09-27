@@ -375,19 +375,20 @@ def test_secure_key_file_windows_restricts_to_system_and_administrators(
     calls = []
 
     def fake_run(args, **kwargs):
-        calls.append(args[2:])
+        calls.append(args)
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(setup.subprocess, "run", fake_run)
     key_file = tmp_path / "id_ed25519_client"
+    icacls = ["icacls", str(key_file)]
 
     setup.secure_key_file(key_file)
 
     assert calls == [
-        ["/setowner", "*S-1-5-32-544"],
-        ["/inheritance:r"],
-        ["/remove:g", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "gene"],
-        ["/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"],
+        ["takeown", "/F", str(key_file), "/A"],
+        [*icacls, "/inheritance:r"],
+        [*icacls, "/remove:g", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "gene"],
+        [*icacls, "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"],
     ]
 
 
