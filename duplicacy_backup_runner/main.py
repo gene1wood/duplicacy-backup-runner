@@ -187,9 +187,11 @@ class RunLogger:
         )
         handlers: list[logging.Handler] = []
         self._raw_streams = []
+        self._file_handlers: dict[Path, logging.FileHandler] = {}
         for path in file_paths:
             file_handler = logging.FileHandler(path, encoding="utf-8")
             handlers.append(file_handler)
+            self._file_handlers[path] = file_handler
             if path != persistent_log_path:
                 self._raw_streams.append(file_handler.stream)
         console_handler = logging.StreamHandler(sys.stdout)
@@ -208,6 +210,18 @@ class RunLogger:
 
     def debug(self, message: str) -> None:
         self._logger.debug(message)
+
+    def close_log_file(self, path: Path) -> None:
+        """Stops logging to path and closes it, so it can be deleted -- on
+        Windows a file can't be deleted while it's still open. Later lines
+        still go to the remaining log files and the console."""
+        file_handler = self._file_handlers.pop(path, None)
+        if file_handler is None:
+            return
+        self._logger.removeHandler(file_handler)
+        if file_handler.stream in self._raw_streams:
+            self._raw_streams.remove(file_handler.stream)
+        file_handler.close()
 
     def write_raw(self, line: str) -> None:
         """Write a line of unprefixed subprocess output to the run log and
@@ -613,7 +627,13 @@ def sftp_run(
     """Runs `commands` (newline-separated sftp batch-mode commands, e.g.
     "pwd\\n" or "put ...\\nrm ...\\n") against one sftp server, returning
     the completed process rather than raising on a non-zero exit -- callers
-    decide what a failure means here."""
+    decide what a failure means here, including a timeout, which is
+    reported as returncode -1.
+
+    Output goes to temporary files rather than pipes: on Windows sftp.exe
+    runs ssh.exe as a child that holds sftp's output handles, so reading
+    pipes to EOF (as subprocess.run does, even after killing sftp on a
+    timeout) can block forever while ssh.exe lingers."""
     cmd = [
         sftp_executable(),
         "-o",
@@ -626,16 +646,44 @@ def sftp_run(
         f"UserKnownHostsFile={known_hosts}",
         f"{user}@{host}",
     ]
-    return subprocess.run(
-        cmd,
-        input=commands,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=stdout_file, stderr=stderr_file
+        )
+        assert process.stdin is not None
+        with contextlib.suppress(OSError):
+            # sftp may exit (e.g. on a failed connection) before reading it all
+            process.stdin.write(commands.encode("utf-8"))
+        with contextlib.suppress(OSError):
+            process.stdin.close()
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_process_tree(process)
+            process.wait()
+            returncode = -1
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+    if returncode == -1:
+        stderr += f"\nsftp timed out after {timeout} seconds"
+    return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+
+def kill_process_tree(process: subprocess.Popen) -> None:
+    """Kills process and, on Windows, its children too (e.g. the ssh.exe
+    that sftp.exe starts), which process.kill() alone would leave running."""
+    if IS_WINDOWS:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True,
+            check=False,
+        )
+    process.kill()
 
 
 def sftp_executable() -> str:
@@ -1431,8 +1479,11 @@ def upload_log(
         sftp_target.port,
         sftp_target.key_file,
         known_hosts_path,
+        # A long backup's run log can be many megabytes
+        timeout=600,
     )
     if result.returncode == 0:
+        run_logger.close_log_file(run_log_path)
         run_log_path.unlink(missing_ok=True)
     else:
         run_logger.error(

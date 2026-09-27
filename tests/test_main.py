@@ -1510,3 +1510,56 @@ def test_run_logger_without_log_paths_is_console_only(tmp_path, capsys):
 def test_main_rejects_dry_run_with_setup():
     with pytest.raises(SystemExit):
         main.main(["--dry-run", "setup"])
+
+
+def test_sftp_run_reports_timeout_instead_of_hanging(monkeypatch, tmp_path):
+    # A child that outlives sftp while holding its output handles open, like
+    # ssh.exe does under Windows' sftp.exe
+    fake_sftp = tmp_path / "fake_sftp.py"
+    fake_sftp.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "time.sleep(30)\n"
+    )
+    monkeypatch.setattr(main, "sftp_executable", lambda: sys.executable)
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(
+        main.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: real_popen([sys.executable, str(fake_sftp)], **kwargs),
+    )
+
+    result = main.sftp_run(
+        "pwd\n", "alice", "example.com", 22, tmp_path / "key", tmp_path / "kh", 1
+    )
+
+    assert result.returncode == -1
+    assert "timed out" in result.stderr
+
+
+def test_upload_log_deletes_run_log_that_is_still_being_logged_to(
+    monkeypatch, tmp_path
+):
+    run_log, persistent_log, lastrun_log = main.create_log_files(
+        tmp_path, "client", "run.txt"
+    )
+    run_logger = main.RunLogger(run_log, persistent_log, lastrun_log, 0)
+    run_logger.info("before upload")
+    monkeypatch.setattr(main, "sftp_run", _fake_sftp_run())
+    sftp_target = main.SftpTarget(
+        name="default",
+        client="alice",
+        server="example.com",
+        port=22,
+        key_file=main.Path("/keys/id_ed25519"),
+        remote_root="backup",
+        writable=True,
+    )
+
+    main.upload_log(
+        run_log, "run.txt", sftp_target, tmp_path / "kh", "host", run_logger
+    )
+    run_logger.info("after upload")
+
+    assert not run_log.exists()
+    assert "after upload" in persistent_log.read_text()
