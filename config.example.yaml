@@ -47,6 +47,10 @@ backup_directories:
 
 # Optional. If set, written to <duplicacy_basedir>/keys/known_hosts before each run,
 # in `ssh-keyscan`/known_hosts format, so sftp connections trust the expected hosts.
+# Include an entry for every sftp server in every backup directory's preferences.
+# This is the source of truth: hand edits to the known_hosts file are overwritten
+# (with a warning listing any entries dropped). Leave it unset to manage the file
+# yourself instead.
 # known_hosts_string: |
 #   [example.com]:1234 ecdsa-sha2-nistp256 AAAA...
 

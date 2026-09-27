@@ -10,7 +10,7 @@ For each configured backup directory, it:
 - Reads every destination from `.duplicacy/preferences` (a repository can back up to
   more than one storage). For sftp destinations, it checks connectivity and remote
   directory ownership to decide whether this host may prune it; each sftp entry needs
-  its own `keys.ssh_key_file`.
+  its own `keys.ssh_key_file`, and its server's host key in `known_hosts_string`.
 - Runs `duplicacy init` against any destination missing its "chunks" directory,
   using RSA encryption if exactly one RSA public key is found under
   `<duplicacy_basedir>/keys` (detected by content, not filename), otherwise plain
@@ -110,9 +110,10 @@ are skipped rather than run concurrently.
 - Output goes to the console only; no log files are written or uploaded, no
   healthchecks.io pings are sent, and no lock is taken.
 - Read-only checks still run: sftp connectivity, remote ownership, and
-  `duplicacy info` for RSA detection. If `known_hosts_string` differs from
-  `<duplicacy_basedir>/keys/known_hosts`, a temporary copy is used instead of
-  updating the real file.
+  `duplicacy info` for RSA detection. When `known_hosts_string` is set, the
+  sftp checks use a temporary copy generated from it rather than updating
+  `<duplicacy_basedir>/keys/known_hosts`, and any difference from the real file
+  is still reported.
 
 A dry run needs the duplicacy binary to already be installed. `--dry-run`
 isn't supported with `setup`.

@@ -88,6 +88,9 @@ class ConsoleAnnouncer:
     def info(self, message: str) -> None:
         announce(message)
 
+    def warning(self, message: str) -> None:
+        announce(f"WARNING: {message}", fg="yellow")
+
     def error(self, message: str) -> None:
         announce_error(message)
 
@@ -321,14 +324,14 @@ def create_destination_logs_directory(
     storage_url: str, ssh_key_file: Path | None, known_hosts_path: Path
 ) -> None:
     """Creates a logs/ directory at the destination -- locally, or over sftp
-    (mkdir is harmlessly a no-op if it already exists)."""
+    (a failed mkdir, e.g. because it already exists, is ignored)."""
     if main.is_local_storage(storage_url):
         (Path(storage_url) / "logs").mkdir(parents=True, exist_ok=True)
         return
     client, server, port = main.parse_sftp_target(storage_url)
     remote_root = main.derive_remote_name(storage_url)
     main.sftp_run(
-        f"mkdir {remote_root}/logs\n",
+        f'-mkdir "{remote_root}/logs"\n',
         client,
         server,
         port,
@@ -733,6 +736,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     prompt_until_symlinks_present(backup_directory)
 
     client = main.short_hostname()
+    config_path = args.config or main.default_config_path()
     duplicacy_binary = main.duplicacy_binary_path(duplicacy_basedir)
     existing = read_existing_default_entry(backup_directory)
     if existing is None:
@@ -767,7 +771,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             )
         known_hosts_string = prompt_for_known_hosts_string()
         known_hosts_path = main.ensure_known_hosts(
-            duplicacy_basedir, known_hosts_string
+            duplicacy_basedir, known_hosts_string, config_path, ConsoleAnnouncer()
         )
 
     new_password: str | None = None
@@ -808,7 +812,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
             duplicacy_binary, backup_directory, "password", new_password, storage_name
         )
 
-    config_path = args.config or main.default_config_path()
     prompt_and_write_config(
         config_path,
         backup_directory,
