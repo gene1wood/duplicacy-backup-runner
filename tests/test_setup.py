@@ -8,6 +8,7 @@ from duplicacy_backup_runner import main, setup
 
 
 def test_check_setup_prerequisites_reports_missing_binaries(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
     monkeypatch.setattr(
         setup.shutil,
         "which",
@@ -19,6 +20,17 @@ def test_check_setup_prerequisites_reports_missing_binaries(monkeypatch):
 
 def test_check_setup_prerequisites_empty_when_all_present(monkeypatch):
     monkeypatch.setattr(setup.shutil, "which", lambda name: "/usr/bin/" + name)
+
+    assert setup.check_setup_prerequisites() == []
+
+
+def test_check_setup_prerequisites_windows_needs_only_sftp(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        setup.shutil,
+        "which",
+        lambda name: None if name == "openssl" else "C:/bin/" + name,
+    )
 
     assert setup.check_setup_prerequisites() == []
 
@@ -292,7 +304,7 @@ def test_duplicacy_set_builds_expected_args(monkeypatch, tmp_path):
 
     args, kwargs = calls[0]
     assert args == [
-        "/opt/duplicacy/bin/duplicacy",
+        str(main.Path("/opt/duplicacy/bin/duplicacy")),
         "set",
         "-key",
         "ssh_key_file",
@@ -336,13 +348,145 @@ def test_duplicacy_set_raises_on_failure(monkeypatch, tmp_path):
 
 
 def test_running_as_root_true_for_uid_zero(monkeypatch):
-    monkeypatch.setattr(setup.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup.os, "geteuid", lambda: 0, raising=False)
     assert setup.running_as_root() is True
 
 
 def test_running_as_root_false_for_nonzero_uid(monkeypatch):
-    monkeypatch.setattr(setup.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup.os, "geteuid", lambda: 1000, raising=False)
     assert setup.running_as_root() is False
+
+
+def test_prompt_encryption_choice_async_without_openssl_uses_password(monkeypatch):
+    monkeypatch.setattr(setup, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(setup, "ask", lambda *a, **k: "async")
+    monkeypatch.setattr(setup.shutil, "which", lambda name: None)
+
+    assert setup.prompt_encryption_choice("client", main.Path("/keys")) == (True, None)
+
+
+def test_secure_key_file_windows_restricts_to_system_and_administrators(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    monkeypatch.setattr(setup.getpass, "getuser", lambda: "gene")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[2:])
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(setup.subprocess, "run", fake_run)
+    key_file = tmp_path / "id_ed25519_client"
+
+    setup.secure_key_file(key_file)
+
+    assert calls == [
+        ["/setowner", "*S-1-5-32-544"],
+        ["/inheritance:r"],
+        ["/remove:g", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "gene"],
+        ["/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"],
+    ]
+
+
+def test_windows_task_action_uses_console_script_and_default_config(monkeypatch):
+    monkeypatch.setattr(
+        setup.shutil,
+        "which",
+        lambda name: "C:/venv/Scripts/duplicacy-backup-runner.exe",
+    )
+
+    assert setup.windows_task_action(main.default_config_path()) == (
+        "C:/venv/Scripts/duplicacy-backup-runner.exe",
+        "",
+    )
+
+
+def test_windows_task_action_quotes_explicit_config_path(monkeypatch):
+    monkeypatch.setattr(setup.shutil, "which", lambda name: None)
+
+    command, arguments = setup.windows_task_action(main.Path("C:/My Configs/c.yaml"))
+
+    assert command == setup.sys.executable
+    assert arguments.startswith("-m duplicacy_backup_runner.main --config ")
+    assert arguments.endswith('"')
+
+
+def test_windows_task_xml_matches_systemd_timer_schedule():
+    content = setup.windows_task_xml(
+        "C:/venv/Scripts/duplicacy-backup-runner.exe", "", main.Path("C:/duplicacy")
+    )
+
+    assert "<RandomDelay>PT3H</RandomDelay>" in content
+    assert "<UserId>S-1-5-18</UserId>" in content
+    assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in content
+    assert "<StartWhenAvailable>true</StartWhenAvailable>" in content
+    assert "<Command>C:/venv/Scripts/duplicacy-backup-runner.exe</Command>" in content
+    assert "<Arguments>" not in content
+
+
+def test_windows_task_xml_escapes_arguments():
+    content = setup.windows_task_xml(
+        "python.exe", '--config "C:/a&b/c.yaml"', main.Path("C:/duplicacy")
+    )
+
+    assert '<Arguments>--config "C:/a&amp;b/c.yaml"</Arguments>' in content
+
+
+def test_install_windows_scheduled_task_prints_when_not_admin(monkeypatch, capsys):
+    monkeypatch.setattr(setup, "running_as_root", lambda: False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("nothing should be registered when not elevated")
+
+    monkeypatch.setattr(setup.subprocess, "run", fail_if_called)
+
+    setup.install_windows_scheduled_task(
+        main.default_config_path(), main.Path("C:/duplicacy")
+    )
+
+    out = capsys.readouterr().out
+    assert "schtasks /Create /TN duplicacy-backup-runner" in out
+    assert "<Task " in out
+
+
+def test_install_windows_scheduled_task_skips_existing_task(monkeypatch):
+    monkeypatch.setattr(setup, "running_as_root", lambda: True)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(setup.subprocess, "run", fake_run)
+
+    setup.install_windows_scheduled_task(
+        main.default_config_path(), main.Path("C:/duplicacy")
+    )
+
+    assert calls == [["schtasks", "/Query", "/TN", "duplicacy-backup-runner"]]
+
+
+def test_install_windows_scheduled_task_creates_from_utf16_xml(monkeypatch):
+    monkeypatch.setattr(setup, "running_as_root", lambda: True)
+    created = []
+
+    def fake_run(args, **kwargs):
+        if args[1] == "/Query":
+            return subprocess.CompletedProcess(args, 1)
+        created.append(main.Path(args[-1]).read_text(encoding="utf-16"))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(setup.subprocess, "run", fake_run)
+
+    setup.install_windows_scheduled_task(
+        main.default_config_path(), main.Path("C:/duplicacy")
+    )
+
+    assert len(created) == 1
+    assert created[0].startswith('<?xml version="1.0"?>')
 
 
 def test_prompt_encryption_choice_declines_encryption(monkeypatch):

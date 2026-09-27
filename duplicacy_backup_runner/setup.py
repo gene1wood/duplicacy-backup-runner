@@ -15,18 +15,27 @@ a circular import at module load time.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import shutil
-import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import click
 import yaml
 
 from duplicacy_backup_runner import main
+
+WINDOWS_TASK_NAME = "duplicacy-backup-runner"
+# Well-known SIDs, used instead of account names, which are localized
+WINDOWS_SYSTEM_SID = "*S-1-5-18"
+WINDOWS_ADMINISTRATORS_SID = "*S-1-5-32-544"
+WINDOWS_BROAD_SIDS = ("*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545")  # Everyone,
+# Authenticated Users, Users
 
 
 def ask(prompt_text: str, **kwargs) -> str:
@@ -91,8 +100,13 @@ class ConsoleAnnouncer:
 
 def check_setup_prerequisites() -> list[str]:
     """Returns the names of any required external commands not found on
-    PATH."""
-    return [name for name in ("sftp", "openssl") if shutil.which(name) is None]
+    PATH. openssl is only needed for RSA encryption, which isn't offered on
+    Windows unless openssl happens to be installed (see
+    prompt_encryption_choice)."""
+    missing = [] if shutil.which(main.sftp_executable()) else ["sftp"]
+    if not main.IS_WINDOWS and shutil.which("openssl") is None:
+        missing.append("openssl")
+    return missing
 
 
 def prompt_for_backup_directory() -> Path:
@@ -102,12 +116,18 @@ def prompt_for_backup_directory() -> Path:
 def prompt_until_symlinks_present(backup_directory: Path) -> None:
     """Waits for the user to populate backup_directory with symlinks to the
     paths they want backed up."""
+    example = (
+        f"From an administrator command prompt: mklink /D "
+        f"{backup_directory / 'C-Users'} C:\\Users"
+        if main.IS_WINDOWS
+        else f"ln --verbose --symbolic /boot {backup_directory}/boot"
+    )
     while not any(
         entry for entry in backup_directory.iterdir() if entry.name != ".duplicacy"
     ):
         click.secho(
             f"You'll need to set up symbolic links in {backup_directory}\n"
-            f"Example: ln --verbose --symbolic /boot {backup_directory}/boot",
+            f"Example: {example}",
             fg="yellow",
         )
         ask("Press enter once you've done this", default="", show_default=False)
@@ -126,7 +146,7 @@ def prompt_for_storage_url(client: str) -> str:
 def prompt_for_ssh_key_file(client: str, keys_dir: Path) -> Path:
     """Prompts for the path to the SSH private key copied over from the
     server for this client, defaulting to the first id_*_<client> match in
-    keys_dir, and chmods it 600."""
+    keys_dir, and restricts its permissions with secure_key_file."""
     candidates = sorted(keys_dir.glob(f"id_*_{client}"))
     default = str(candidates[0]) if candidates else None
     key_file = Path(
@@ -136,8 +156,37 @@ def prompt_for_ssh_key_file(client: str, keys_dir: Path) -> Path:
             type=click.Path(exists=True),
         )
     )
-    key_file.chmod(0o600)
+    secure_key_file(key_file)
     return key_file
+
+
+def secure_key_file(key_file: Path) -> None:
+    """Restricts key_file's permissions so ssh will use it: chmod 600 on
+    POSIX. Windows OpenSSH instead rejects a key whose owner isn't SYSTEM,
+    Administrators or the current user, or whose ACL grants anyone else
+    access, so there this makes Administrators the owner and grants access
+    only to SYSTEM (which the scheduled task runs as) and Administrators
+    (for setup, run from an elevated prompt). The owner is set first so
+    this also works on a key that's accessible only to SYSTEM."""
+    if not main.IS_WINDOWS:
+        key_file.chmod(0o600)
+        return
+    icacls = ["icacls", str(key_file)]
+    subprocess.run([*icacls, "/setowner", WINDOWS_ADMINISTRATORS_SID], check=True)
+    subprocess.run([*icacls, "/inheritance:r"], check=True)
+    # Not checked, since the current user may have no entry to remove
+    subprocess.run(
+        [*icacls, "/remove:g", *WINDOWS_BROAD_SIDS, getpass.getuser()], check=False
+    )
+    subprocess.run(
+        [
+            *icacls,
+            "/grant:r",
+            f"{WINDOWS_SYSTEM_SID}:F",
+            f"{WINDOWS_ADMINISTRATORS_SID}:F",
+        ],
+        check=True,
+    )
 
 
 def prompt_for_known_hosts_string() -> str:
@@ -192,6 +241,15 @@ def prompt_encryption_choice(client: str, keys_dir: Path) -> tuple[bool, Path | 
         default="sync",
     )
     if choice == "sync":
+        return True, None
+    if shutil.which("openssl") is None:
+        # Only possible on Windows; check_setup_prerequisites requires it
+        # elsewhere
+        announce(
+            "openssl isn't installed, so RSA encryption isn't available; using "
+            "password encryption",
+            fg="yellow",
+        )
         return True, None
     candidates = main.find_rsa_public_keys(keys_dir)
     if len(candidates) > 1:
@@ -337,7 +395,13 @@ def duplicacy_set(
     if storage_name is not None:
         args += ["-storage", storage_name]
     result = subprocess.run(
-        args, cwd=backup_directory, capture_output=True, text=True, check=False
+        args,
+        cwd=backup_directory,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
     )
     if result.returncode != 0:
         announce_error(f"duplicacy set -key {key} failed: {result.stderr}")
@@ -346,7 +410,7 @@ def duplicacy_set(
 
 def load_existing_config_dict(config_path: Path) -> dict:
     try:
-        return yaml.safe_load(config_path.read_text()) or {}
+        return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         return {}
 
@@ -389,7 +453,7 @@ ConfigDumper.add_representer(str, represent_str)
 
 def write_config(config_path: Path, raw_config: dict) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.dump(raw_config, Dumper=ConfigDumper))
+    config_path.write_text(yaml.dump(raw_config, Dumper=ConfigDumper), encoding="utf-8")
 
 
 def prompt_and_write_config(
@@ -403,8 +467,8 @@ def prompt_and_write_config(
     raw_config["healthchecks_uuid"] = prompt_for_healthchecks_uuid(
         raw_config.get("healthchecks_uuid")
     )
-    raw_config.setdefault("client_individual_id", socket.gethostname().split(".")[0])
-    if duplicacy_basedir != Path("/opt/duplicacy"):
+    raw_config.setdefault("client_individual_id", main.short_hostname())
+    if duplicacy_basedir != main.DEFAULT_DUPLICACY_BASEDIR:
         raw_config["duplicacy_basedir"] = str(duplicacy_basedir)
     if known_hosts_string:
         raw_config["known_hosts_string"] = known_hosts_string
@@ -417,6 +481,12 @@ def prompt_and_write_config(
 
 
 def running_as_root() -> bool:
+    """True if running as root, or on Windows, as an elevated
+    administrator."""
+    if main.IS_WINDOWS:
+        import ctypes
+
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
     return os.geteuid() == 0
 
 
@@ -529,6 +599,101 @@ def install_scheduled_run(exec_command: str) -> None:
         install_cron_d_entry(exec_command)
 
 
+def windows_task_action(config_path: Path) -> tuple[str, str]:
+    """The Command and Arguments for the Windows scheduled task, which Task
+    Scheduler keeps separate (unlike the single command line that
+    build_exec_command produces for systemd and cron), so a path containing
+    spaces needs no quoting in Command.
+
+    :returns: The executable and its command-line-quoted arguments.
+    """
+    script = shutil.which("duplicacy-backup-runner")
+    if script:
+        command, arguments = script, []
+    else:
+        command, arguments = sys.executable, ["-m", "duplicacy_backup_runner.main"]
+    if config_path != main.default_config_path():
+        arguments += ["--config", str(config_path)]
+    return command, subprocess.list2cmdline(arguments)
+
+
+def windows_task_xml(command: str, arguments: str, working_directory: Path) -> str:
+    """Task Scheduler XML equivalent to the systemd timer: nightly between
+    1AM and 4AM local time, run as SYSTEM, started late if the machine was
+    off (StartWhenAvailable, like systemd's Persistent=true), and skipped if
+    a run is still going. The XML declaration names no encoding, so
+    schtasks goes by the file's byte order mark."""
+    arguments_element = (
+        f"      <Arguments>{escape(arguments)}</Arguments>\n" if arguments else ""
+    )
+    return (
+        '<?xml version="1.0"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo>\n"
+        "    <Description>Incremental backup with Duplicacy followed by pruning"
+        "</Description>\n"
+        "  </RegistrationInfo>\n"
+        "  <Triggers>\n"
+        "    <CalendarTrigger>\n"
+        "      <StartBoundary>2026-01-01T01:00:00</StartBoundary>\n"
+        "      <RandomDelay>PT3H</RandomDelay>\n"
+        "      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n"
+        "    </CalendarTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        '    <Principal id="Author">\n'
+        "      <UserId>S-1-5-18</UserId>\n"
+        "      <RunLevel>HighestAvailable</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
+        "    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        "    <Exec>\n"
+        f"      <Command>{escape(command)}</Command>\n"
+        f"{arguments_element}"
+        f"      <WorkingDirectory>{escape(str(working_directory))}"
+        "</WorkingDirectory>\n"
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
+
+
+def install_windows_scheduled_task(config_path: Path, working_directory: Path) -> None:
+    """Registers the WINDOWS_TASK_NAME scheduled task if it doesn't already
+    exist, or, when not elevated, prints its XML for the user to import."""
+    command, arguments = windows_task_action(config_path)
+    task_xml = windows_task_xml(command, arguments, working_directory)
+    if not running_as_root():
+        click.secho(
+            "Not running as administrator -- nothing installed. Run setup from an "
+            "elevated prompt to install a scheduled task, or save the XML below "
+            f"and run: schtasks /Create /TN {WINDOWS_TASK_NAME} /XML <file>",
+            fg="yellow",
+        )
+        click.echo(task_xml)
+        return
+    query = subprocess.run(
+        ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME],
+        capture_output=True,
+        check=False,
+    )
+    if query.returncode == 0:
+        return
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        xml_path = Path(scratch_dir) / "task.xml"
+        xml_path.write_text(task_xml, encoding="utf-16")
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", WINDOWS_TASK_NAME, "/XML", str(xml_path)],
+            check=False,
+        )
+
+
 def print_first_run_instructions(
     duplicacy_binary: Path, backup_directory: Path
 ) -> None:
@@ -557,7 +722,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         duplicacy_basedir, duplicacy_basedir / "logs", ConsoleAnnouncer()
     )
     main.provision_duplicacy_binary(
-        duplicacy_basedir / "bin" / "duplicacy",
+        main.duplicacy_binary_path(duplicacy_basedir),
         args.duplicacy_version or main.DEFAULT_DUPLICACY_VERSION,
         None,
         ConsoleAnnouncer(),
@@ -567,8 +732,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     backup_directory.mkdir(parents=True, exist_ok=True)
     prompt_until_symlinks_present(backup_directory)
 
-    client = socket.gethostname().split(".")[0]
-    duplicacy_binary = duplicacy_basedir / "bin" / "duplicacy"
+    client = main.short_hostname()
+    duplicacy_binary = main.duplicacy_binary_path(duplicacy_basedir)
     existing = read_existing_default_entry(backup_directory)
     if existing is None:
         storage_url = prompt_for_storage_url(client)
@@ -594,6 +759,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if existing is not None and existing.ssh_key_file is not None:
             ssh_key_file = existing.ssh_key_file
             main.provision_ssh_key_permissions(backup_directory, ConsoleAnnouncer())
+            if main.IS_WINDOWS and ssh_key_file.is_file():
+                secure_key_file(ssh_key_file)
         else:
             ssh_key_file = new_ssh_key_file = prompt_for_ssh_key_file(
                 client, duplicacy_basedir / "keys"
@@ -650,8 +817,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         args.filters_url,
     )
 
-    exec_command = build_exec_command(resolve_console_script_path(), config_path)
-    install_scheduled_run(exec_command)
+    if main.IS_WINDOWS:
+        install_windows_scheduled_task(config_path, duplicacy_basedir)
+    else:
+        exec_command = build_exec_command(resolve_console_script_path(), config_path)
+        install_scheduled_run(exec_command)
 
     print_first_run_instructions(duplicacy_binary, backup_directory)
     return 0

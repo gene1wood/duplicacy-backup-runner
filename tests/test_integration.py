@@ -80,6 +80,15 @@ class _CapturingRunLogger(_NullRunLogger):
         self.messages.append(message)
 
 
+def _install_duplicacy(duplicacy_basedir: Path) -> None:
+    """Copies the real duplicacy binary to where Config.duplicacy_binary
+    expects it (bin/duplicacy, or bin/duplicacy.exe on Windows)."""
+    binary = main.duplicacy_binary_path(duplicacy_basedir)
+    binary.parent.mkdir(parents=True)
+    shutil.copy(DUPLICACY_BINARY, binary)
+    binary.chmod(0o755)
+
+
 def _make_config(tmp_path: Path, **overrides) -> main.Config:
     """A Config pointing at a private copy of the real duplicacy binary
     under tmp_path. internet_check_* is left at its normal default here --
@@ -88,9 +97,7 @@ def _make_config(tmp_path: Path, **overrides) -> main.Config:
     test_main_backs_up_through_the_real_cli_entrypoint below for a test that
     does exercise it, against a local server rather than the real internet."""
     duplicacy_basedir = tmp_path / "duplicacy"
-    (duplicacy_basedir / "bin").mkdir(parents=True)
-    shutil.copy(DUPLICACY_BINARY, duplicacy_basedir / "bin" / "duplicacy")
-    (duplicacy_basedir / "bin" / "duplicacy").chmod(0o755)
+    _install_duplicacy(duplicacy_basedir)
     (duplicacy_basedir / "keys").mkdir()
 
     defaults = {
@@ -117,24 +124,33 @@ def _make_config(tmp_path: Path, **overrides) -> main.Config:
 
 class _OKHandler(http.server.BaseHTTPRequestHandler):
     """Answers every request with a bare 200, standing in for "the internet
-    is up" without touching the real internet."""
+    is up" and for healthchecks.io without touching the real internet."""
 
     def do_GET(self) -> None:
         self.send_response(200)
         self.end_headers()
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.do_GET()
 
     def log_message(self, format: str, *args) -> None:
         pass  # silence BaseHTTPRequestHandler's default access logging
 
 
 @pytest.fixture
-def local_http_server() -> Iterator[str]:
+def local_http_server(monkeypatch) -> Iterator[str]:
     """Starts a local HTTP server that always answers 200, for tests that
     need wait_for_internet's connectivity check to genuinely succeed without
-    depending on (or simulating the absence of) real internet access."""
+    depending on (or simulating the absence of) real internet access. Also
+    points healthchecks.io pings at it, so they neither reach the real
+    service (as they would from CI) nor depend on it failing fast."""
     server = http.server.HTTPServer(("127.0.0.1", 0), _OKHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    monkeypatch.setattr(
+        main, "HEALTHCHECKS_BASE_URL", f"http://127.0.0.1:{server.server_port}"
+    )
     try:
         yield f"http://127.0.0.1:{server.server_port}/"
     finally:
@@ -406,10 +422,8 @@ def test_main_backs_up_through_the_real_cli_entrypoint(tmp_path, local_http_serv
     internet_check_url points at local_http_server, a real server that
     really answers 200 -- proving the connectivity check succeeds rather
     than just being disabled. A successful check needs no retries, so it
-    costs nothing; healthchecks.io pings, unreachable from this sandbox,
-    fail in milliseconds against its network policy (a fast HTTP 403, not a
-    timeout) and are tolerated by design, so they don't slow this down
-    either. The elapsed-time assertion below is what actually distinguishes
+    costs nothing, and healthchecks.io pings go to the same local server.
+    The elapsed-time assertion below is what actually distinguishes
     "the check succeeded quickly" from "the check silently failed and this
     only looks fast because something else broke first".
     """
@@ -421,9 +435,7 @@ def test_main_backs_up_through_the_real_cli_entrypoint(tmp_path, local_http_serv
     _run_duplicacy(repo, "init", "default", str(storage))
 
     duplicacy_basedir = tmp_path / "duplicacy"
-    (duplicacy_basedir / "bin").mkdir(parents=True)
-    shutil.copy(DUPLICACY_BINARY, duplicacy_basedir / "bin" / "duplicacy")
-    (duplicacy_basedir / "bin" / "duplicacy").chmod(0o755)
+    _install_duplicacy(duplicacy_basedir)
     (duplicacy_basedir / "keys").mkdir()
 
     config_path = tmp_path / "config.yaml"
@@ -538,9 +550,7 @@ def test_setup_then_run_backs_up_successfully(tmp_path, monkeypatch, local_http_
     (repo / "data").symlink_to(target)
 
     duplicacy_basedir = tmp_path / "duplicacy"
-    (duplicacy_basedir / "bin").mkdir(parents=True)
-    shutil.copy(DUPLICACY_BINARY, duplicacy_basedir / "bin" / "duplicacy")
-    (duplicacy_basedir / "bin" / "duplicacy").chmod(0o755)
+    _install_duplicacy(duplicacy_basedir)
 
     config_path = tmp_path / "config.yaml"
 
@@ -603,9 +613,7 @@ def test_setup_reuses_existing_preferences_without_prompting(tmp_path, monkeypat
     preferences_before = (repo / ".duplicacy" / "preferences").read_text()
 
     duplicacy_basedir = tmp_path / "duplicacy"
-    (duplicacy_basedir / "bin").mkdir(parents=True)
-    shutil.copy(DUPLICACY_BINARY, duplicacy_basedir / "bin" / "duplicacy")
-    (duplicacy_basedir / "bin" / "duplicacy").chmod(0o755)
+    _install_duplicacy(duplicacy_basedir)
     config_path = tmp_path / "config.yaml"
 
     def fail_confirm(*args, **kwargs):

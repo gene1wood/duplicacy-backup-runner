@@ -1,12 +1,14 @@
 # Copy to the config path shown by `duplicacy-backup-runner --help`
 # (platformdirs user config dir, e.g. /root/.config/duplicacy-backup-runner/config.yaml
-# when run as root), or point at it explicitly with --config.
+# when run as root; C:\duplicacy\config.yaml on Windows), or point at it
+# explicitly with --config.
 
 # Required. The healthchecks.io check UUID this run reports start/success/failure/log to.
 healthchecks_uuid: "00000000-0000-0000-0000-000000000000"
 
 # Optional. Identifies this host's persistent log file (duplicacy.<id>.txt) and
-# the healthchecks.io payloads. Defaults to the short hostname.
+# the healthchecks.io payloads. Defaults to the short hostname (lowercased on
+# Windows).
 # client_individual_id: my-host
 
 # Duplicacy backup directories to process, each containing a .duplicacy/ preferences
@@ -20,7 +22,7 @@ healthchecks_uuid: "00000000-0000-0000-0000-000000000000"
 # can ask Duplicacy whether it's RSA-encrypted. See README.md for how multiple
 # destinations are handled.
 backup_directories:
-  - /opt/duplicacy/backup
+  - /opt/duplicacy/backup  # C:\duplicacy\backup on Windows
 
 # Optional. Root of the Duplicacy install; keys/, bin/duplicacy, and the default
 # logs/ directory are resolved relative to this. If a destination is missing its
@@ -28,12 +30,14 @@ backup_directories:
 # against it, using RSA encryption if it finds a file under keys/ whose content is a
 # PEM RSA public key (any filename; detected by content, not name) -- otherwise
 # plain password encryption if the destination's preferences mark it encrypted.
+# Defaults to C:\duplicacy on Windows.
 # duplicacy_basedir: /opt/duplicacy
 
 # Optional. Defaults to <duplicacy_basedir>/logs.
 # log_basedir: /opt/duplicacy/logs
 
-# Optional. Path to the lock file used to prevent overlapping runs.
+# Optional. Path to the lock file used to prevent overlapping runs. Defaults to
+# <duplicacy_basedir>\duplicacy-backup.lock on Windows.
 # lock_file: /var/lock/duplicacy-backup
 
 # Optional. If this host has an IP address matching rate_limit_ip, duplicacy backup

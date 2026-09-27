@@ -1,0 +1,75 @@
+# GitHub Actions workflow: test on Windows. Run on demand from the Actions
+# tab, or with: gh workflow run windows.yml --ref <branch>
+#
+# The "test" job runs the unit and integration tests (the latter against a
+# real duplicacy.exe). The "end-to-end" job runs tests/test_windows_e2e.py,
+# which changes machine-wide state (C:\duplicacy, a Task Scheduler task, key
+# file ownership) -- fine on a throwaway runner, which runs elevated.
+#
+# Actions are pinned to commit hashes rather than version tags; see the
+# comment in release.yml.
+name: Windows tests
+
+on:
+  workflow_dispatch:
+
+env:
+  DUPLICACY_VERSION: "3.2.5"
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Download duplicacy.exe
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP "duplicacy.exe"
+          Invoke-WebRequest -Uri "https://github.com/gilbertchen/duplicacy/releases/download/v$env:DUPLICACY_VERSION/duplicacy_win_x64_$env:DUPLICACY_VERSION.exe" -OutFile $binary
+          "DUPLICACY_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Run tests
+        run: python -m pytest
+
+  end-to-end:
+    name: End-to-end
+    runs-on: windows-latest
+    env:
+      DUPLICACY_BACKUP_RUNNER_WINDOWS_E2E: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install package and dev dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Download duplicacy.exe
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP "duplicacy.exe"
+          Invoke-WebRequest -Uri "https://github.com/gilbertchen/duplicacy/releases/download/v$env:DUPLICACY_VERSION/duplicacy_win_x64_$env:DUPLICACY_VERSION.exe" -OutFile $binary
+          "DUPLICACY_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Run end-to-end tests
+        run: python -m pytest -v tests/test_windows_e2e.py
+
+      - name: Show duplicacy-backup-runner logs
+        if: always()
+        shell: pwsh
+        run: Get-ChildItem C:\duplicacy\logs -File -ErrorAction SilentlyContinue | ForEach-Object { "==> $($_.FullName)"; Get-Content $_.FullName }

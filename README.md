@@ -117,6 +117,35 @@ are skipped rather than run concurrently.
 A dry run needs the duplicacy binary to already be installed. `--dry-run`
 isn't supported with `setup`.
 
+## Windows
+
+The tool runs on Windows 10/11 as well. It needs Python and the built-in
+OpenSSH Client (`sftp.exe`, under Settings > Optional features). On Windows:
+
+- `duplicacy_basedir` defaults to `C:\duplicacy`, and `config.yaml` lives at
+  `C:\duplicacy\config.yaml` rather than in a per-user directory, since
+  `setup` runs as an administrator but the scheduled task runs as SYSTEM.
+- The default `client_individual_id` is the lowercased computer name.
+- Install into a virtualenv that SYSTEM can read and that doesn't depend on
+  your profile, e.g.:
+
+  ```powershell
+  py -m venv C:\duplicacy\venv
+  C:\duplicacy\venv\Scripts\pip install duplicacy-backup-runner
+  ```
+
+- Run `C:\duplicacy\venv\Scripts\duplicacy-backup-runner setup` from an
+  **elevated** prompt. It:
+  - asks you to create directory symlinks in the backup directory with
+    `mklink /D` (which also needs an elevated prompt)
+  - makes the SSH private key owned by Administrators and readable only by
+    SYSTEM and Administrators, which Windows OpenSSH requires
+  - registers a `duplicacy-backup-runner` Task Scheduler task that runs
+    nightly between 1AM and 4AM as SYSTEM, starts late if the machine was
+    off, and doesn't start while a previous run is still going.
+- RSA encryption is only offered if `openssl` is on the PATH; otherwise
+  password encryption is used.
+
 ## Migrating from run-scheduled-duplicacy-backup.bash
 
 - `config.bash`'s `HC_UUID`, `CLIENT_INDIVIDUAL_ID`, `BACKUP_DIRECTORIES`,
@@ -162,3 +191,24 @@ In an environment with no real internet egress, point `internet_check_url` at a
 local server that answers 200 rather than lowering
 `internet_check_attempts`/`internet_check_delay` — that exercises the real success
 path instead of the "no internet" fallback.
+
+### CI
+
+The **Test** workflow (`.github/workflows/test.yml`) runs on every push to
+`main` and every pull request: ruff, plus the unit and integration tests on
+Linux against a downloaded `duplicacy` binary.
+
+The **Windows tests** workflow (`.github/workflows/windows.yml`) only runs when
+started by hand, from the Actions tab or with:
+
+```bash
+gh workflow run windows.yml --ref <branch>
+```
+
+It runs the unit and integration tests on Windows, then
+`tests/test_windows_e2e.py`. That file checks that Windows OpenSSH accepts the
+key file permissions `setup` sets, including on a key owned by and only
+readable by SYSTEM. It also registers the real scheduled task and runs a backup
+through it as SYSTEM. These end-to-end tests change machine-wide state
+(`C:\duplicacy`, a scheduled task), so they're skipped unless
+`DUPLICACY_BACKUP_RUNNER_WINDOWS_E2E=1` is set, which only that workflow does.

@@ -10,10 +10,10 @@ import collections
 import contextlib
 import dataclasses
 import enum
-import fcntl
 import json
 import logging
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -34,10 +34,19 @@ import yaml
 
 from duplicacy_backup_runner import __version__
 
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 CONFIG_APP_NAME = "duplicacy-backup-runner"
 HEALTHCHECKS_BASE_URL = "https://hc-ping.com"
 PRUNE_KEEP_ARGS = ["-keep", "0:360", "-keep", "30:180", "-keep", "7:30", "-keep", "1:7"]
 DEFAULT_DUPLICACY_VERSION = "3.2.5"
+DEFAULT_DUPLICACY_BASEDIR = Path("C:/duplicacy" if IS_WINDOWS else "/opt/duplicacy")
+# Where the Windows OpenSSH Client optional feature installs sftp
+WINDOWS_SFTP_PATH = Path("C:/Windows/System32/OpenSSH/sftp.exe")
 
 
 @dataclasses.dataclass
@@ -63,10 +72,28 @@ class Config:
 
     @property
     def duplicacy_binary(self) -> Path:
-        return self.duplicacy_basedir / "bin" / "duplicacy"
+        return duplicacy_binary_path(self.duplicacy_basedir)
+
+
+def duplicacy_binary_path(duplicacy_basedir: Path) -> Path:
+    return duplicacy_basedir / "bin" / ("duplicacy.exe" if IS_WINDOWS else "duplicacy")
+
+
+def short_hostname() -> str:
+    """This host's name without its domain, used as the default
+    client_individual_id and in log file names. Lowercased on Windows,
+    whose hostnames are conventionally uppercase."""
+    name = socket.gethostname().split(".")[0]
+    return name.lower() if IS_WINDOWS else name
 
 
 def default_config_path() -> Path:
+    """On Windows, config.yaml lives in DEFAULT_DUPLICACY_BASEDIR rather than
+    a per-user platformdirs directory, because setup runs as an
+    administrator but the scheduled task runs as SYSTEM, and each would
+    otherwise look in its own profile."""
+    if IS_WINDOWS:
+        return DEFAULT_DUPLICACY_BASEDIR / "config.yaml"
     return platformdirs.user_config_path(CONFIG_APP_NAME) / "config.yaml"
 
 
@@ -80,7 +107,7 @@ def load_config(path: Path | None) -> Config:
     """
     config_path = path or default_config_path()
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         raise SystemExit(f"Config file not found: {config_path}")
 
@@ -90,18 +117,25 @@ def load_config(path: Path | None) -> Config:
             f"Config isn't set. Aborting (missing healthchecks_uuid in {config_path})"
         )
 
-    hostname_short = socket.gethostname().split(".")[0]
-    duplicacy_basedir = Path(raw.get("duplicacy_basedir", "/opt/duplicacy"))
+    duplicacy_basedir = Path(raw.get("duplicacy_basedir", DEFAULT_DUPLICACY_BASEDIR))
+    default_lock_file = (
+        duplicacy_basedir / "duplicacy-backup.lock"
+        if IS_WINDOWS
+        else Path("/var/lock/duplicacy-backup")
+    )
 
     return Config(
         healthchecks_uuid=healthchecks_uuid,
-        client_individual_id=raw.get("client_individual_id", hostname_short),
+        client_individual_id=raw.get("client_individual_id", short_hostname()),
         backup_directories=[
-            Path(d) for d in raw.get("backup_directories", ["/opt/duplicacy/backup"])
+            Path(d)
+            for d in raw.get(
+                "backup_directories", [DEFAULT_DUPLICACY_BASEDIR / "backup"]
+            )
         ],
         duplicacy_basedir=duplicacy_basedir,
         log_basedir=Path(raw.get("log_basedir", duplicacy_basedir / "logs")),
-        lock_file=Path(raw.get("lock_file", "/var/lock/duplicacy-backup")),
+        lock_file=Path(raw.get("lock_file", default_lock_file)),
         rate_limit_ip=raw.get("rate_limit_ip"),
         rate_limit_rate=raw.get("rate_limit_rate", 32),
         known_hosts_string=raw.get("known_hosts_string"),
@@ -154,7 +188,7 @@ class RunLogger:
         handlers: list[logging.Handler] = []
         self._raw_streams = []
         for path in file_paths:
-            file_handler = logging.FileHandler(path)
+            file_handler = logging.FileHandler(path, encoding="utf-8")
             handlers.append(file_handler)
             if path != persistent_log_path:
                 self._raw_streams.append(file_handler.stream)
@@ -220,11 +254,20 @@ def wait_for_internet(
 def resolve_rate_limit(rate_limit_ip: str | None, rate_limit_rate: int) -> int | None:
     """Returns the configured rate limit in KB/s if this host has
     rate_limit_ip configured on any network interface, otherwise None
-    (unlimited). Compares exact addresses (via `ip -json addr show`) rather
-    than a substring match, since e.g. "192.168.1.5" is a substring of
-    "192.168.1.50" and must not match it."""
+    (unlimited). Compares exact addresses (via `ip -json addr show`, or on
+    Windows, which has no `ip`, the addresses this host's name resolves to)
+    rather than a substring match, since e.g. "192.168.1.5" is a substring
+    of "192.168.1.50" and must not match it."""
     if not rate_limit_ip:
         return None
+    if IS_WINDOWS:
+        try:
+            host_ips = {
+                info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)
+            }
+        except OSError:
+            return None
+        return rate_limit_rate if rate_limit_ip in host_ips else None
     result = subprocess.run(
         ["ip", "-json", "addr", "show"], capture_output=True, text=True, check=False
     )
@@ -258,18 +301,22 @@ def ensure_known_hosts(
     known_hosts_path = (write_dir or duplicacy_basedir / "keys") / "known_hosts"
     if known_hosts_string:
         try:
-            current = known_hosts_path.read_text()
+            current = known_hosts_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             current = None
         if current != known_hosts_string:
-            known_hosts_path.write_text(known_hosts_string)
+            known_hosts_path.write_text(known_hosts_string, encoding="utf-8")
     return known_hosts_path
 
 
 def default_duplicacy_download_url(version: str) -> str:
+    """The x64 GitHub release asset for this platform, e.g.
+    duplicacy_linux_x64_3.2.5 or duplicacy_win_x64_3.2.5.exe."""
+    os_name = "win" if IS_WINDOWS else "linux"
+    suffix = ".exe" if IS_WINDOWS else ""
     return (
         "https://github.com/gilbertchen/duplicacy/releases/download/"
-        f"v{version}/duplicacy_linux_x64_{version}"
+        f"v{version}/duplicacy_{os_name}_x64_{version}{suffix}"
     )
 
 
@@ -338,7 +385,11 @@ def chmod_if_needed(
     path: Path, mode: int, run_logger: RunLogger, dry_run: bool = False
 ) -> None:
     """Chmods path to mode only if it isn't already that mode (or, in a dry
-    run, only logs that it would)."""
+    run, only logs that it would). A no-op on Windows, where chmod only
+    toggles the read-only attribute: key file access there is controlled by
+    the ACL that setup applies (see setup.secure_key_file)."""
+    if IS_WINDOWS:
+        return
     try:
         if stat.S_IMODE(path.stat().st_mode) == mode:
             return
@@ -525,7 +576,7 @@ def read_storage_entries(backup_directory: Path) -> list[StorageEntry]:
     preferences file (there's one entry per storage the repository backs up
     to, "default" being the first one added)."""
     raw_entries = json.loads(
-        (backup_directory / ".duplicacy" / "preferences").read_text()
+        (backup_directory / ".duplicacy" / "preferences").read_text(encoding="utf-8")
     )
     return [StorageEntry.from_preferences(raw) for raw in raw_entries]
 
@@ -564,7 +615,7 @@ def sftp_run(
     the completed process rather than raising on a non-zero exit -- callers
     decide what a failure means here."""
     cmd = [
-        "sftp",
+        sftp_executable(),
         "-o",
         f"Port={port}",
         "-o",
@@ -580,9 +631,22 @@ def sftp_run(
         input=commands,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         check=False,
     )
+
+
+def sftp_executable() -> str:
+    """sftp from PATH, except on Windows, where the built-in OpenSSH
+    Client's sftp is preferred if installed: a scheduled task running as
+    SYSTEM may not have it on its PATH, and an sftp found first on PATH
+    (e.g. Git for Windows' Unix tools) wouldn't necessarily handle Windows
+    paths and key file ACLs the same way."""
+    if IS_WINDOWS and WINDOWS_SFTP_PATH.is_file():
+        return str(WINDOWS_SFTP_PATH)
+    return shutil.which("sftp") or "sftp"
 
 
 def test_sftp_connectivity(
@@ -663,7 +727,7 @@ def log_filters(run_logger: RunLogger, backup_directory: Path) -> None:
     filters_path = backup_directory / ".duplicacy" / "filters"
     run_logger.info(f"Filters for {backup_directory}")
     if filters_path.exists():
-        for line in filters_path.read_text().splitlines():
+        for line in filters_path.read_text(encoding="utf-8").splitlines():
             run_logger.info(f"Filter line : {line}")
 
 
@@ -686,6 +750,8 @@ def run_duplicacy(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         env=env,
     )
@@ -776,7 +842,7 @@ def find_rsa_public_keys(keys_dir: Path) -> list[Path]:
         if not candidate.is_file():
             continue
         try:
-            content = candidate.read_text()
+            content = candidate.read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             continue
         if "BEGIN PUBLIC KEY" in content or "BEGIN RSA PUBLIC KEY" in content:
@@ -1019,6 +1085,8 @@ def check_rsa_encryption(
         [str(config.duplicacy_binary), "-verbose", "info", "-e", local_entry.storage],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env={**os.environ, "DUPLICACY_PASSWORD": local_entry.password},
         timeout=60,
         check=False,
@@ -1374,22 +1442,28 @@ def upload_log(
 
 @contextlib.contextmanager
 def held_lock(lock_file: Path) -> Iterator[bool]:
-    """Context manager around a non-blocking flock on lock_file, so
-    overlapping scheduled runs skip each other instead of running
-    concurrently. Yields True if the lock was acquired -- and holds it for
-    as long as the `with` block runs -- or False if another run already
-    holds it."""
+    """Context manager around a non-blocking flock (msvcrt.locking of the
+    first byte on Windows) on lock_file, so overlapping scheduled runs skip
+    each other instead of running concurrently. Yields True if the lock was
+    acquired -- and holds it for as long as the `with` block runs -- or
+    False if another run already holds it."""
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_file, "w") as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if IS_WINDOWS:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            if IS_WINDOWS:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1427,7 +1501,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "config.yaml, scheduled run)",
     )
     setup_parser.add_argument(
-        "--duplicacy-basedir", type=Path, default=Path("/opt/duplicacy")
+        "--duplicacy-basedir", type=Path, default=DEFAULT_DUPLICACY_BASEDIR
     )
     setup_parser.add_argument("--backup-directory", type=Path, default=None)
     setup_parser.add_argument("--filters-url", default=None)
@@ -1440,7 +1514,7 @@ def tail_of_file(path: Path, count: int) -> str:
     """Return the last `count` lines of `path` without loading the whole
     file into memory, since a multi-hour backup's run log can be large."""
     last_lines: collections.deque[str] = collections.deque(maxlen=count)
-    with path.open("r") as handle:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             last_lines.append(line.rstrip("\n"))
     return "\n".join(last_lines)
@@ -1458,7 +1532,7 @@ def create_log_files(
     log_basedir.mkdir(parents=True, exist_ok=True)
 
     lastrun_log_path = log_basedir / f"duplicacy.{client_individual_id}.lastrun.txt"
-    lastrun_log_path.write_text("")
+    lastrun_log_path.write_text("", encoding="utf-8")
     lastrun_log_path.chmod(0o640)
 
     run_log_path = log_basedir / log_file_name
@@ -1603,6 +1677,10 @@ def main(argv: list[str] | None = None) -> int:
     backup run. Returns the process exit code (0 success; 1 on failure or
     if another run already holds the lock)."""
     args = parse_args(argv)
+    if IS_WINDOWS and hasattr(sys.stdout, "reconfigure"):
+        # Under Task Scheduler stdout is redirected with the ANSI code page,
+        # which can't encode every file name duplicacy prints
+        sys.stdout.reconfigure(errors="replace")
     if args.command == "setup":
         if args.dry_run:
             raise SystemExit("--dry-run isn't supported with setup")
@@ -1618,7 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose
         else getattr(logging, level_name.upper(), logging.INFO)
     )
-    hostname_short = socket.gethostname().split(".")[0]
+    hostname_short = short_hostname()
     run_uuid = str(uuid.uuid4())
 
     if config.dry_run:

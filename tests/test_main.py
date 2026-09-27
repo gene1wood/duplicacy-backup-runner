@@ -1,13 +1,17 @@
 import http.server
 import json
-import socket
 import subprocess
+import sys
 import threading
 
 import pytest
 import yaml
 
 from duplicacy_backup_runner import main
+
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX permissions or commands"
+)
 
 
 def test_load_config_requires_healthchecks_uuid(tmp_path):
@@ -23,12 +27,13 @@ def test_load_config_defaults(tmp_path):
     config = main.load_config(config_path)
 
     assert config.healthchecks_uuid == "abc123"
-    assert config.client_individual_id == socket.gethostname().split(".")[0]
-    assert config.backup_directories == [main.Path("/opt/duplicacy/backup")]
-    assert config.duplicacy_basedir == main.Path("/opt/duplicacy")
-    assert config.log_basedir == main.Path("/opt/duplicacy/logs")
+    basedir = main.DEFAULT_DUPLICACY_BASEDIR
+    assert config.client_individual_id == main.short_hostname()
+    assert config.backup_directories == [basedir / "backup"]
+    assert config.duplicacy_basedir == basedir
+    assert config.log_basedir == basedir / "logs"
     assert config.rate_limit_rate == 32
-    assert config.duplicacy_binary == main.Path("/opt/duplicacy/bin/duplicacy")
+    assert config.duplicacy_binary == main.duplicacy_binary_path(basedir)
     assert config.internet_check_attempts == 5
     assert config.internet_check_delay == 5
     assert config.internet_check_url == "http://www.google.com/"
@@ -557,6 +562,7 @@ def test_resolve_rate_limit_returns_none_without_ip():
     assert main.resolve_rate_limit(None, 32) is None
 
 
+@posix_only
 def test_resolve_rate_limit_matches_exact_address(monkeypatch):
     def fake_run(cmd, **kwargs):
         payload = [{"addr_info": [{"local": "192.168.1.50"}]}]
@@ -569,6 +575,7 @@ def test_resolve_rate_limit_matches_exact_address(monkeypatch):
     assert main.resolve_rate_limit("192.168.1.50", 32) == 32
 
 
+@posix_only
 def test_resolve_rate_limit_does_not_match_address_prefix(monkeypatch):
     """Regression test: a naive substring match would incorrectly treat
     "192.168.1.5" as present on a host whose real address is
@@ -582,6 +589,18 @@ def test_resolve_rate_limit_does_not_match_address_prefix(monkeypatch):
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
 
+    assert main.resolve_rate_limit("192.168.1.5", 32) is None
+
+
+def test_resolve_rate_limit_windows_uses_resolved_host_addresses(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda host, port: [(None, None, None, "", ("192.168.1.50", 0))],
+    )
+
+    assert main.resolve_rate_limit("192.168.1.50", 32) == 32
     assert main.resolve_rate_limit("192.168.1.5", 32) is None
 
 
@@ -613,6 +632,7 @@ def test_duplicacy_init_env_passes_password_and_ssh_key_file(tmp_path):
     assert env["DUPLICACY_SSH_KEY_FILE"] == str(key)
 
 
+@posix_only
 def test_run_duplicacy_does_not_wait_on_stdin(tmp_path):
     """A prompt duplicacy wasn't given an answer for must fail fast rather
     than block forever reading the terminal."""
@@ -967,6 +987,7 @@ class _CapturingRunLogger(_NullRunLogger):
         self.errors.append(message)
 
 
+@posix_only
 def test_provision_basedir_creates_directories_and_chmods_keys(tmp_path):
     duplicacy_basedir = tmp_path / "duplicacy"
     log_basedir = tmp_path / "logs"
@@ -979,6 +1000,7 @@ def test_provision_basedir_creates_directories_and_chmods_keys(tmp_path):
     assert main.stat.S_IMODE((duplicacy_basedir / "keys").stat().st_mode) == 0o700
 
 
+@posix_only
 def test_provision_basedir_is_idempotent_when_already_correct(tmp_path):
     duplicacy_basedir = tmp_path / "duplicacy"
     log_basedir = tmp_path / "logs"
@@ -1041,6 +1063,7 @@ def fixed_payload_http_server():
         thread.join(timeout=5)
 
 
+@posix_only
 def test_provision_duplicacy_binary_downloads_and_chmods_when_missing(
     tmp_path, fixed_payload_http_server
 ):
@@ -1076,10 +1099,70 @@ def test_provision_duplicacy_binary_logs_error_on_download_failure(tmp_path):
         ),
     ],
 )
-def test_default_duplicacy_download_url_format(version, expected):
+def test_default_duplicacy_download_url_format(monkeypatch, version, expected):
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
     assert main.default_duplicacy_download_url(version) == expected
 
 
+def test_default_duplicacy_download_url_on_windows(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+
+    assert main.default_duplicacy_download_url("3.2.5").endswith(
+        "v3.2.5/duplicacy_win_x64_3.2.5.exe"
+    )
+
+
+def test_duplicacy_binary_path_adds_exe_on_windows(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+
+    assert main.duplicacy_binary_path(main.Path("base")).name == "duplicacy.exe"
+
+
+def test_short_hostname_lowercased_only_on_windows(monkeypatch):
+    monkeypatch.setattr(main.socket, "gethostname", lambda: "DESKTOP-ABC.example")
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    assert main.short_hostname() == "desktop-abc"
+
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
+    assert main.short_hostname() == "DESKTOP-ABC"
+
+
+def test_default_config_path_is_in_basedir_on_windows(monkeypatch):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+
+    assert main.default_config_path() == main.DEFAULT_DUPLICACY_BASEDIR / "config.yaml"
+
+
+def test_chmod_if_needed_is_noop_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    path = tmp_path / "key"
+    path.write_text("key")
+    run_logger = _CapturingRunLogger()
+
+    main.chmod_if_needed(path, 0o600, run_logger, dry_run=True)
+
+    assert run_logger.messages == []
+
+
+def test_sftp_executable_prefers_openssh_feature_path_on_windows(monkeypatch, tmp_path):
+    sftp = tmp_path / "sftp.exe"
+    sftp.write_text("")
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    monkeypatch.setattr(main, "WINDOWS_SFTP_PATH", sftp)
+    monkeypatch.setattr(main.shutil, "which", lambda name: "C:/Git/usr/bin/sftp")
+
+    assert main.sftp_executable() == str(sftp)
+
+
+def test_sftp_executable_uses_path_when_openssh_feature_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+    monkeypatch.setattr(main, "WINDOWS_SFTP_PATH", tmp_path / "missing.exe")
+    monkeypatch.setattr(main.shutil, "which", lambda name: "C:/Git/usr/bin/sftp")
+
+    assert main.sftp_executable() == "C:/Git/usr/bin/sftp"
+
+
+@posix_only
 def test_provision_ssh_key_permissions_chmods_referenced_key(tmp_path):
     duplicacy_dir = tmp_path / ".duplicacy"
     duplicacy_dir.mkdir()
@@ -1358,6 +1441,7 @@ def test_run_copy_to_destination_dry_run_doesnt_run_copy(monkeypatch, tmp_path):
     assert any("Dry run: would copy" in m for m in run_logger.messages)
 
 
+@posix_only
 def test_provision_dry_run_changes_nothing(tmp_path):
     backup_directory = tmp_path / "backup"
     (backup_directory / ".duplicacy").mkdir(parents=True)

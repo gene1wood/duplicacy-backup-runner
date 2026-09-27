@@ -1,0 +1,51 @@
+# GitHub Actions workflow: run the test suite on Linux, including the
+# integration tests against a real duplicacy binary. Windows is tested
+# separately, on demand, by windows.yml.
+#
+# Actions are pinned to commit hashes rather than version tags; see the
+# comment in release.yml.
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DUPLICACY_VERSION: "3.2.5"
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Download duplicacy for the integration tests
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/duplicacy" \
+            "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_x64_${DUPLICACY_VERSION}"
+          chmod 755 "$RUNNER_TEMP/duplicacy"
+          echo "DUPLICACY_TEST_BINARY=$RUNNER_TEMP/duplicacy" >> "$GITHUB_ENV"
+
+      - name: Check formatting and lint
+        run: |
+          python -m ruff format --check .
+          python -m ruff check .
+
+      - name: Run tests
+        run: python -m pytest
