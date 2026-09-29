@@ -103,6 +103,19 @@ Install a cron job or systemd timer that runs `duplicacy-backup-runner` on your
 schedule; it takes out a lock file (`lock_file` in the config) so overlapping runs
 are skipped rather than run concurrently.
 
+The systemd unit, cron entry, or Windows scheduled task that `setup` installs
+upgrades `duplicacy-backup-runner` from PyPI before each run. It uses
+`pipx upgrade` if the tool was installed with pipx on Linux, and the
+virtualenv's own `pip` otherwise. If the upgrade fails, for example because
+PyPI can't be reached, the backup still runs on the installed version. `setup`
+leaves this step out when the tool isn't in a virtualenv, or was installed from
+a local path or URL (e.g. `pip install -e .`), since an upgrade would replace
+it with the PyPI release. A scheduled run is stopped after 72 hours so a hung
+run can't block the next night's run.
+
+`setup` doesn't overwrite a unit, cron entry, or task that already exists. To
+pick up changes like this one, delete it and re-run `setup`.
+
 ### Dry run
 
 `--dry-run` shows what a run would do without changing anything:
@@ -150,7 +163,8 @@ OpenSSH Client (`sftp.exe`, under Settings > Optional features). On Windows:
     SYSTEM and Administrators, which Windows OpenSSH requires
   - registers a `duplicacy-backup-runner` Task Scheduler task that runs
     nightly between 1AM and 4AM as SYSTEM, starts late if the machine was
-    off, and doesn't start while a previous run is still going.
+    off, doesn't start while a previous run is still going, and upgrades
+    `duplicacy-backup-runner` with the virtualenv's `pip` before each run.
 - RSA encryption is only offered if `openssl` is on the PATH; otherwise
   password encryption is used.
 

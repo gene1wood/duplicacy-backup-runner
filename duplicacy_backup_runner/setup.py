@@ -19,7 +19,9 @@ import base64
 import getpass
 import hashlib
 import hmac
+import importlib.metadata
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,7 +35,12 @@ import yaml
 
 from duplicacy_backup_runner import main
 
+PACKAGE_NAME = "duplicacy-backup-runner"
 WINDOWS_TASK_NAME = "duplicacy-backup-runner"
+# How long a scheduled run (upgrade plus backup) may take before it is killed,
+# so a hung run can't block every later nightly run, including the upgrade
+# that might fix it
+RUN_TIME_LIMIT_HOURS = 72
 # Well-known SIDs, used instead of account names, which are localized
 WINDOWS_SYSTEM_SID = "*S-1-5-18"
 WINDOWS_ADMINISTRATORS_SID = "*S-1-5-32-544"
@@ -638,6 +645,45 @@ def resolve_console_script_path() -> str:
     )
 
 
+def resolve_upgrade_command() -> list[str] | None:
+    """The command a scheduled run uses to upgrade duplicacy-backup-runner
+    from PyPI before each backup: `pipx upgrade` when running from a
+    pipx-managed virtualenv on Linux, otherwise the virtualenv's own pip
+    (which also works in a pipx virtualenv, through pipx's shared pip).
+    pipx is pointed at the PIPX_HOME and PIPX_BIN_DIR in use now, since
+    the scheduled run's environment may not match setup's.
+
+    :returns: The command, or None when there's nothing safe to upgrade:
+        outside a virtualenv, or when the package was installed from a
+        local path or URL (e.g. an editable checkout) rather than an index,
+        which an upgrade would replace with the PyPI release.
+    :rtype: list[str] | None
+    """
+    if sys.prefix == sys.base_prefix:
+        return None
+    distribution = importlib.metadata.distribution(PACKAGE_NAME)
+    if distribution.read_text("direct_url.json") is not None:
+        return None
+    venv = Path(sys.prefix)
+    pipx = shutil.which("pipx")
+    env = shutil.which("env")
+    if not main.IS_WINDOWS and (venv / "pipx_metadata.json").is_file() and pipx and env:
+        command = [env, f"PIPX_HOME={venv.parent.parent}"]
+        console_script = shutil.which(PACKAGE_NAME)
+        if console_script:
+            command.append(f"PIPX_BIN_DIR={Path(console_script).parent}")
+        return command + [pipx, "upgrade", "--quiet", PACKAGE_NAME]
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--quiet",
+        "--upgrade",
+        PACKAGE_NAME,
+    ]
+
+
 def build_exec_command(duplicacy_backup_runner_path: str, config_path: Path) -> str:
     command = duplicacy_backup_runner_path
     if config_path != main.default_config_path():
@@ -645,13 +691,21 @@ def build_exec_command(duplicacy_backup_runner_path: str, config_path: Path) -> 
     return command
 
 
-def systemd_service_unit_content(exec_command: str) -> str:
+def systemd_service_unit_content(
+    exec_command: str, upgrade_command: str | None = None
+) -> str:
+    """The service unit. upgrade_command, if given, runs first, with a
+    failure (e.g. PyPI unreachable) ignored so the backup still runs on the
+    installed version."""
+    upgrade_line = f"ExecStartPre=-{upgrade_command}\n" if upgrade_command else ""
     return (
         "[Unit]\n"
         "Description=Incremental backup with Duplicacy followed by pruning\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
+        f"TimeoutStartSec={RUN_TIME_LIMIT_HOURS}h\n"
+        f"{upgrade_line}"
         f"ExecStart={exec_command}\n"
     )
 
@@ -673,7 +727,9 @@ def systemd_timer_unit_content() -> str:
     )
 
 
-def cron_d_content(exec_command: str) -> str:
+def cron_d_content(exec_command: str, upgrade_command: str | None = None) -> str:
+    if upgrade_command:
+        exec_command = f"{upgrade_command}; {exec_command}"
     return (
         "SHELL=/bin/bash\n"
         "# Run duplicacy-backup-runner every night between 1AM and 4AM\n"
@@ -683,14 +739,18 @@ def cron_d_content(exec_command: str) -> str:
 
 
 def install_systemd_units(
-    exec_command: str, unit_dir: Path = Path("/etc/systemd/system")
+    exec_command: str,
+    upgrade_command: str | None = None,
+    unit_dir: Path = Path("/etc/systemd/system"),
 ) -> None:
     """Writes the service/timer units if missing, only enabling the timer
     when it was just written."""
     service_path = unit_dir / "duplicacy-backup-runner.service"
     timer_path = unit_dir / "duplicacy-backup-runner.timer"
     if not service_path.exists():
-        service_path.write_text(systemd_service_unit_content(exec_command))
+        service_path.write_text(
+            systemd_service_unit_content(exec_command, upgrade_command)
+        )
     if not timer_path.exists():
         timer_path.write_text(systemd_timer_unit_content())
         subprocess.run(
@@ -701,33 +761,38 @@ def install_systemd_units(
 
 def install_cron_d_entry(
     exec_command: str,
+    upgrade_command: str | None = None,
     cron_path: Path = Path("/etc/cron.d/duplicacy-backup-runner.cron"),
 ) -> None:
     if not cron_path.exists():
-        cron_path.write_text(cron_d_content(exec_command))
+        cron_path.write_text(cron_d_content(exec_command, upgrade_command))
 
 
-def print_would_install_scheduled_run(exec_command: str) -> None:
+def print_would_install_scheduled_run(
+    exec_command: str, upgrade_command: str | None
+) -> None:
     click.secho(
         "Not running as root -- nothing installed. Run as root to install a "
         "scheduled run, or copy the content below yourself:",
         fg="yellow",
     )
     if detect_init_system() == "systemd":
-        click.echo(systemd_service_unit_content(exec_command))
+        click.echo(systemd_service_unit_content(exec_command, upgrade_command))
         click.echo(systemd_timer_unit_content())
     else:
-        click.echo(cron_d_content(exec_command))
+        click.echo(cron_d_content(exec_command, upgrade_command))
 
 
-def install_scheduled_run(exec_command: str) -> None:
+def install_scheduled_run(
+    exec_command: str, upgrade_command: str | None = None
+) -> None:
     if not running_as_root():
-        print_would_install_scheduled_run(exec_command)
+        print_would_install_scheduled_run(exec_command, upgrade_command)
         return
     if detect_init_system() == "systemd":
-        install_systemd_units(exec_command)
+        install_systemd_units(exec_command, upgrade_command)
     else:
-        install_cron_d_entry(exec_command)
+        install_cron_d_entry(exec_command, upgrade_command)
 
 
 def windows_task_action(config_path: Path) -> tuple[str, str]:
@@ -748,14 +813,42 @@ def windows_task_action(config_path: Path) -> tuple[str, str]:
     return command, subprocess.list2cmdline(arguments)
 
 
-def windows_task_xml(command: str, arguments: str, working_directory: Path) -> str:
-    """Task Scheduler XML equivalent to the systemd timer: nightly between
-    1AM and 4AM local time, run as SYSTEM, started late if the machine was
-    off (StartWhenAvailable, like systemd's Persistent=true), and skipped if
-    a run is still going. The XML declaration names no encoding, so
-    schtasks goes by the file's byte order mark."""
+def windows_exec_element(command: str, arguments: str, working_directory: Path) -> str:
     arguments_element = (
         f"      <Arguments>{escape(arguments)}</Arguments>\n" if arguments else ""
+    )
+    return (
+        "    <Exec>\n"
+        f"      <Command>{escape(command)}</Command>\n"
+        f"{arguments_element}"
+        f"      <WorkingDirectory>{escape(str(working_directory))}"
+        "</WorkingDirectory>\n"
+        "    </Exec>\n"
+    )
+
+
+def windows_task_xml(
+    command: str,
+    arguments: str,
+    working_directory: Path,
+    upgrade_command: list[str] | None = None,
+) -> str:
+    """Task Scheduler XML equivalent to the systemd timer: nightly between
+    1AM and 4AM local time, run as SYSTEM, started late if the machine was
+    off (StartWhenAvailable, like systemd's Persistent=true), skipped if a
+    run is still going, and stopped after RUN_TIME_LIMIT_HOURS.
+    upgrade_command, if given, is a first action; Task Scheduler runs
+    actions in order and should run the backup even if the upgrade exits
+    non-zero (unverified). The XML declaration names no encoding, so
+    schtasks goes by the file's byte order mark."""
+    upgrade_element = (
+        windows_exec_element(
+            upgrade_command[0],
+            subprocess.list2cmdline(upgrade_command[1:]),
+            working_directory,
+        )
+        if upgrade_command
+        else ""
     )
     return (
         '<?xml version="1.0"?>\n'
@@ -782,14 +875,11 @@ def windows_task_xml(command: str, arguments: str, working_directory: Path) -> s
         "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
         "    <StartWhenAvailable>true</StartWhenAvailable>\n"
         "    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>\n"
+        f"    <ExecutionTimeLimit>PT{RUN_TIME_LIMIT_HOURS}H</ExecutionTimeLimit>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
-        "    <Exec>\n"
-        f"      <Command>{escape(command)}</Command>\n"
-        f"{arguments_element}"
-        f"      <WorkingDirectory>{escape(str(working_directory))}"
-        "</WorkingDirectory>\n"
-        "    </Exec>\n"
+        f"{upgrade_element}"
+        f"{windows_exec_element(command, arguments, working_directory)}"
         "  </Actions>\n"
         "</Task>\n"
     )
@@ -799,7 +889,9 @@ def install_windows_scheduled_task(config_path: Path, working_directory: Path) -
     """Registers the WINDOWS_TASK_NAME scheduled task if it doesn't already
     exist, or, when not elevated, prints its XML for the user to import."""
     command, arguments = windows_task_action(config_path)
-    task_xml = windows_task_xml(command, arguments, working_directory)
+    task_xml = windows_task_xml(
+        command, arguments, working_directory, resolve_upgrade_command()
+    )
     if not running_as_root():
         click.secho(
             "Not running as administrator -- nothing installed. Run setup from an "
@@ -1006,7 +1098,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         install_windows_scheduled_task(config_path, duplicacy_basedir)
     else:
         exec_command = build_exec_command(resolve_console_script_path(), config_path)
-        install_scheduled_run(exec_command)
+        upgrade_command = resolve_upgrade_command()
+        install_scheduled_run(
+            exec_command, shlex.join(upgrade_command) if upgrade_command else None
+        )
 
     print_first_run_instructions(
         main.duplicacy_binary_path(duplicacy_basedir), backup_directories

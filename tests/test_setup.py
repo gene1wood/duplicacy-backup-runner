@@ -138,6 +138,133 @@ def test_build_exec_command_includes_config_flag_for_explicit_path(tmp_path):
     assert command == f"/usr/bin/duplicacy-backup-runner --config {config_path}"
 
 
+class FakeDistribution:
+    def __init__(self, direct_url: str | None) -> None:
+        self.direct_url = direct_url
+
+    def read_text(self, filename: str) -> str | None:
+        return self.direct_url if filename == "direct_url.json" else None
+
+
+@pytest.fixture
+def fake_venv(monkeypatch, tmp_path):
+    """A virtualenv at <tmp_path>/pipx/venvs/duplicacy-backup-runner,
+    installed from an index, with pipx and env on PATH."""
+    venv = tmp_path / "pipx" / "venvs" / "duplicacy-backup-runner"
+    venv.mkdir(parents=True)
+    monkeypatch.setattr(main, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup.sys, "prefix", str(venv))
+    monkeypatch.setattr(setup.sys, "base_prefix", "/usr")
+    monkeypatch.setattr(setup.sys, "executable", f"{venv}/bin/python")
+    monkeypatch.setattr(
+        setup.importlib.metadata, "distribution", lambda name: FakeDistribution(None)
+    )
+    monkeypatch.setattr(setup.shutil, "which", lambda name: f"/usr/bin/{name}")
+    return venv
+
+
+def test_resolve_upgrade_command_uses_pip_outside_pipx(fake_venv):
+    assert setup.resolve_upgrade_command() == [
+        f"{fake_venv}/bin/python",
+        "-m",
+        "pip",
+        "install",
+        "--quiet",
+        "--upgrade",
+        "duplicacy-backup-runner",
+    ]
+
+
+def test_resolve_upgrade_command_uses_pipx_with_its_home_and_bin_dir(fake_venv):
+    (fake_venv / "pipx_metadata.json").write_text("{}")
+
+    assert setup.resolve_upgrade_command() == [
+        "/usr/bin/env",
+        f"PIPX_HOME={fake_venv.parent.parent}",
+        "PIPX_BIN_DIR=/usr/bin",
+        "/usr/bin/pipx",
+        "upgrade",
+        "--quiet",
+        "duplicacy-backup-runner",
+    ]
+
+
+def test_resolve_upgrade_command_uses_pip_in_pipx_venv_on_windows(
+    monkeypatch, fake_venv
+):
+    (fake_venv / "pipx_metadata.json").write_text("{}")
+    monkeypatch.setattr(main, "IS_WINDOWS", True)
+
+    assert setup.resolve_upgrade_command()[1:3] == ["-m", "pip"]
+
+
+def test_resolve_upgrade_command_uses_pip_when_pipx_missing(monkeypatch, fake_venv):
+    (fake_venv / "pipx_metadata.json").write_text("{}")
+    monkeypatch.setattr(
+        setup.shutil, "which", lambda name: None if name == "pipx" else name
+    )
+
+    assert setup.resolve_upgrade_command()[1:3] == ["-m", "pip"]
+
+
+def test_resolve_upgrade_command_skips_local_and_editable_installs(
+    monkeypatch, fake_venv
+):
+    monkeypatch.setattr(
+        setup.importlib.metadata,
+        "distribution",
+        lambda name: FakeDistribution('{"dir_info": {"editable": true}}'),
+    )
+
+    assert setup.resolve_upgrade_command() is None
+
+
+def test_resolve_upgrade_command_skips_non_virtualenv(monkeypatch, fake_venv):
+    monkeypatch.setattr(setup.sys, "base_prefix", setup.sys.prefix)
+
+    assert setup.resolve_upgrade_command() is None
+
+
+def test_systemd_service_unit_content_runs_upgrade_first_ignoring_failure():
+    content = setup.systemd_service_unit_content(
+        "/usr/bin/duplicacy-backup-runner", "/usr/bin/pipx upgrade x"
+    )
+
+    assert "ExecStartPre=-/usr/bin/pipx upgrade x\n" in content
+    assert content.index("ExecStartPre=") < content.index("ExecStart=")
+    assert "TimeoutStartSec=72h" in content
+
+
+def test_systemd_service_unit_content_omits_upgrade_when_none():
+    content = setup.systemd_service_unit_content("/usr/bin/duplicacy-backup-runner")
+
+    assert "ExecStartPre" not in content
+
+
+def test_cron_d_content_runs_upgrade_before_backup():
+    content = setup.cron_d_content(
+        "/usr/bin/duplicacy-backup-runner", "/usr/bin/pipx upgrade x"
+    )
+
+    assert "/usr/bin/pipx upgrade x; /usr/bin/duplicacy-backup-runner\n" in content
+
+
+def test_windows_task_xml_runs_upgrade_action_first():
+    content = setup.windows_task_xml(
+        "C:/venv/Scripts/duplicacy-backup-runner.exe",
+        "",
+        main.Path("C:/duplicacy"),
+        ["C:/venv/Scripts/python.exe", "-m", "pip", "install", "--upgrade", "x"],
+    )
+
+    assert content.count("<Exec>") == 2
+    assert content.index("<Command>C:/venv/Scripts/python.exe</Command>") < (
+        content.index("<Command>C:/venv/Scripts/duplicacy-backup-runner.exe</Command>")
+    )
+    assert "<Arguments>-m pip install --upgrade x</Arguments>" in content
+    assert "<ExecutionTimeLimit>PT72H</ExecutionTimeLimit>" in content
+
+
 def test_install_systemd_units_writes_service_and_timer(monkeypatch, tmp_path):
     monkeypatch.setattr(
         setup.subprocess,
@@ -429,6 +556,7 @@ def test_windows_task_xml_matches_systemd_timer_schedule():
     assert "<StartWhenAvailable>true</StartWhenAvailable>" in content
     assert "<Command>C:/venv/Scripts/duplicacy-backup-runner.exe</Command>" in content
     assert "<Arguments>" not in content
+    assert content.count("<Exec>") == 1
 
 
 def test_windows_task_xml_escapes_arguments():
