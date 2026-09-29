@@ -617,6 +617,15 @@ class StorageEntry:
         )
 
 
+def local_storage_path(entry: StorageEntry, backup_directory: Path) -> Path:
+    """A local destination's storage directory, with a relative storage
+    resolved against the repository it belongs to."""
+    storage_path = Path(entry.storage)
+    if not storage_path.is_absolute():
+        storage_path = backup_directory / storage_path
+    return storage_path
+
+
 def read_storage_entries(backup_directory: Path) -> list[StorageEntry]:
     """Returns every destination entry from the repository's duplicacy
     preferences file (there's one entry per storage the repository backs up
@@ -852,8 +861,8 @@ def run_duplicacy(
 @dataclasses.dataclass
 class SftpTarget:
     """An sftp destination that passed connectivity checks, tracked so the
-    run log can be uploaded to the last one touched and so callers know
-    whether they're allowed to modify it (see can_modify_destination)."""
+    run log can be uploaded to it and so callers know whether they're
+    allowed to modify it (see can_modify_destination)."""
 
     name: str
     client: str
@@ -862,6 +871,26 @@ class SftpTarget:
     key_file: Path
     remote_root: str
     writable: bool
+
+    @property
+    def location(self) -> str:
+        return f"{self.client}@{self.server}"
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalTarget:
+    """A local destination, tracked so the run log can be copied into its
+    storage directory's logs/ directory."""
+
+    name: str
+    storage_path: Path
+
+    @property
+    def location(self) -> str:
+        return str(self.storage_path)
+
+
+LogTarget = SftpTarget | LocalTarget
 
 
 class EncryptionStatus(enum.Enum):
@@ -889,10 +918,10 @@ class PreflightResult:
 class Outcome:
     """The result of processing one destination, or one backup_directory's
     worth of destinations: whether everything attempted succeeded, and the
-    last sftp destination touched (for the end-of-run log upload)."""
+    destinations touched (for the end-of-run log upload)."""
 
     ok: bool
-    sftp_target: SftpTarget | None = None
+    log_targets: list[LogTarget] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -1058,9 +1087,7 @@ def preflight_destination(
     exist) so the caller can still track it as a possible log-upload
     target."""
     if entry.is_local:
-        storage_path = Path(entry.storage)
-        if not storage_path.is_absolute():
-            storage_path = backup_directory / storage_path
+        storage_path = local_storage_path(entry, backup_directory)
         if (storage_path / "chunks").is_dir():
             return PreflightResult(ok=True)
         if not initialize_storage(
@@ -1343,19 +1370,31 @@ def process_destination(
 ) -> Outcome:
     """Validates, then backs up (copy_source is None) or copies (copy_source
     names the source destination) to one destination, and prunes it
-    afterward if that succeeded and we're allowed to."""
+    afterward if that succeeded and we're allowed to.
+
+    The destination is included as a log target even on failure, as long as
+    preflight got far enough to identify it, so the run log still reaches
+    it if possible."""
     preflight = preflight_destination(
         entry, backup_directory, config, run_logger, run_uuid, known_hosts_path
     )
+    log_targets: list[LogTarget] = []
+    if entry.is_local:
+        log_targets.append(
+            LocalTarget(entry.name, local_storage_path(entry, backup_directory))
+        )
+    elif preflight.sftp_target is not None:
+        log_targets.append(preflight.sftp_target)
+
     if not preflight.ok:
-        return Outcome(ok=False, sftp_target=preflight.sftp_target)
+        return Outcome(ok=False, log_targets=log_targets)
 
     if not preflight.initialized:
         run_logger.info(
             f"Dry run: skipping backup/copy and prune of destination '{entry.name}' "
             "since its storage hasn't been initialized"
         )
-        return Outcome(ok=True, sftp_target=preflight.sftp_target)
+        return Outcome(ok=True, log_targets=log_targets)
 
     if copy_source is not None:
         step_ok = run_copy_to_destination(
@@ -1372,7 +1411,7 @@ def process_destination(
             entry, backup_directory, config, run_logger, run_uuid, kbyte_limit
         )
     if not step_ok:
-        return Outcome(ok=False, sftp_target=preflight.sftp_target)
+        return Outcome(ok=False, log_targets=log_targets)
 
     if can_modify_destination(preflight.sftp_target):
         duplicacy_prune_destination(
@@ -1384,7 +1423,7 @@ def process_destination(
             "server is owned by root"
         )
 
-    return Outcome(ok=True, sftp_target=preflight.sftp_target)
+    return Outcome(ok=True, log_targets=log_targets)
 
 
 def plan_destinations(
@@ -1473,7 +1512,7 @@ def run_backup_directory(
         return Outcome(ok=False)
 
     overall_ok = True
-    last_sftp_target: SftpTarget | None = None
+    log_targets: list[LogTarget] = []
     for planned in plan:
         outcome = process_destination(
             planned.entry,
@@ -1486,28 +1525,40 @@ def run_backup_directory(
             kbyte_limit,
         )
         overall_ok = overall_ok and outcome.ok
-        if outcome.sftp_target is not None:
-            last_sftp_target = outcome.sftp_target
+        log_targets += outcome.log_targets
 
-    return Outcome(ok=overall_ok, sftp_target=last_sftp_target)
+    return Outcome(ok=overall_ok, log_targets=log_targets)
 
 
-def upload_log(
+def unique_log_targets(log_targets: list[LogTarget]) -> list[LogTarget]:
+    """Drops repeats of the same destination (e.g. one shared by several
+    backup_directories), keeping the first occurrence's position and the
+    last occurrence's details."""
+    unique: dict[object, LogTarget] = {}
+    for target in log_targets:
+        if isinstance(target, SftpTarget):
+            key = (target.client, target.server, target.port, target.remote_root)
+        else:
+            key = target.storage_path.resolve()
+        unique[key] = target
+    return list(unique.values())
+
+
+def upload_log_over_sftp(
     run_log_path: Path,
     log_file_name: str,
     sftp_target: SftpTarget,
     known_hosts_path: Path,
     hostname_short: str,
-    run_logger: RunLogger,
-) -> bool:
+) -> str | None:
     """Uploads run_log_path to sftp_target's remote logs directory (creating
     it if needed, since only setup's default destination gets one up
     front), and -- if we're allowed to modify that destination -- repoints
     its "latest log" symlink at it. Only the put decides success: a failure
     to create the directory (it usually exists already) or to repoint the
-    symlink is ignored. Leaves the local file in place on failure.
+    symlink is ignored.
 
-    :returns: Whether the log was uploaded.
+    :returns: None on success, otherwise the error.
     """
     remote_logs_dir = f"{sftp_target.remote_root}/logs"
     upload_command = (
@@ -1529,17 +1580,80 @@ def upload_log(
         # A long backup's run log can be many megabytes
         timeout=600,
     )
-    if result.returncode == 0:
-        run_logger.info(
-            f"Run complete, log uploaded to {sftp_target.client}@{sftp_target.server}"
-        )
+    return None if result.returncode == 0 else result.stderr
+
+
+def copy_log_locally(
+    run_log_path: Path,
+    log_file_name: str,
+    local_target: LocalTarget,
+    hostname_short: str,
+) -> str | None:
+    """Copies run_log_path into local_target's logs directory (creating it
+    if needed, but not the storage directory itself, so an unmounted drive
+    fails rather than filling its mount point), and repoints its "latest
+    log" symlink at it. Where symlinks aren't permitted (Windows without
+    Developer Mode or admin rights) the latest log is a copy instead. As
+    over sftp, a failure to update the latest log is ignored.
+
+    :returns: None on success, otherwise the error.
+    """
+    logs_dir = local_target.storage_path / "logs"
+    try:
+        logs_dir.mkdir(exist_ok=True)
+        shutil.copyfile(run_log_path, logs_dir / log_file_name)
+    except OSError as error:
+        return str(error)
+
+    latest_path = logs_dir / f"duplicacy.{hostname_short}.latest.txt"
+    with contextlib.suppress(OSError):
+        latest_path.unlink(missing_ok=True)
+        try:
+            latest_path.symlink_to(log_file_name)
+        except OSError:
+            shutil.copyfile(run_log_path, latest_path)
+    return None
+
+
+def upload_logs(
+    run_log_path: Path,
+    log_file_name: str,
+    log_targets: list[LogTarget],
+    known_hosts_path: Path,
+    hostname_short: str,
+    run_logger: RunLogger,
+) -> bool:
+    """Uploads run_log_path to every destination in log_targets, carrying on
+    past failures. The local file is deleted only if every upload
+    succeeded, so a failed one leaves it in place.
+
+    :returns: Whether the log was uploaded to every destination.
+    """
+    all_uploaded = True
+    for target in log_targets:
+        if isinstance(target, SftpTarget):
+            error = upload_log_over_sftp(
+                run_log_path, log_file_name, target, known_hosts_path, hostname_short
+            )
+        else:
+            error = copy_log_locally(
+                run_log_path, log_file_name, target, hostname_short
+            )
+        if error is None:
+            run_logger.info(
+                f"Log uploaded to destination '{target.name}' at {target.location}"
+            )
+        else:
+            run_logger.error(
+                f"Failed to upload log to destination '{target.name}' at "
+                f"{target.location}: {error}"
+            )
+            all_uploaded = False
+
+    if all_uploaded:
         run_logger.close_log_file(run_log_path)
         run_log_path.unlink(missing_ok=True)
-        return True
-    run_logger.error(
-        f"Failed to upload log to {sftp_target.client}@{sftp_target.server}: {result.stderr}"
-    )
-    return False
+    return all_uploaded
 
 
 @contextlib.contextmanager
@@ -1728,7 +1842,7 @@ def _run(
     )
 
     run_failed = False
-    last_sftp_target: SftpTarget | None = None
+    log_targets: list[LogTarget] = []
 
     for backup_directory in config.backup_directories:
         outcome = run_backup_directory(
@@ -1741,8 +1855,8 @@ def _run(
         )
         if not outcome.ok:
             run_failed = True
-        if outcome.sftp_target is not None:
-            last_sftp_target = outcome.sftp_target
+        log_targets += outcome.log_targets
+    log_targets = unique_log_targets(log_targets)
 
     wait_for_internet(
         run_logger,
@@ -1756,23 +1870,23 @@ def _run(
             config, run_uuid, "/log", data=tail_of_file(run_log_path, 13)
         )
 
-    if last_sftp_target is not None and config.dry_run:
-        run_logger.info(
-            f"Dry run complete, would have uploaded log to {last_sftp_target.client}@"
-            f"{last_sftp_target.server}"
-        )
-    elif last_sftp_target is not None:
+    if config.dry_run:
+        for target in log_targets:
+            run_logger.info(
+                f"Dry run: would have uploaded log to destination '{target.name}' at "
+                f"{target.location}"
+            )
+    elif log_targets:
         assert run_log_path is not None
-        upload_log(
+        upload_logs(
             run_log_path,
             log_file_name,
-            last_sftp_target,
+            log_targets,
             known_hosts_path,
             hostname_short,
             run_logger,
         )
-    else:
-        run_logger.info("Run complete")
+    run_logger.info("Run complete")
 
     if not run_failed:
         notify_healthchecks(

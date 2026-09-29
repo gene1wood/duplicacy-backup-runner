@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "duplicacy-backup-runner"
-version = "3.1.2"
+version = "3.2.0"
 description = "Runs a scheduled Duplicacy backup and reports progress to healthchecks.io."
 readme = "README.md"
 license = "GPL-3.0-or-later"

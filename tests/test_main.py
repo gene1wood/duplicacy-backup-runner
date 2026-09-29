@@ -1625,7 +1625,7 @@ def test_sftp_run_reports_timeout_instead_of_hanging(monkeypatch, tmp_path):
     assert "timed out" in result.stderr
 
 
-def test_upload_log_deletes_run_log_that_is_still_being_logged_to(
+def test_upload_logs_deletes_run_log_that_is_still_being_logged_to(
     monkeypatch, tmp_path
 ):
     run_log, persistent_log, lastrun_log = main.create_log_files(
@@ -1634,21 +1634,18 @@ def test_upload_log_deletes_run_log_that_is_still_being_logged_to(
     run_logger = main.RunLogger(run_log, persistent_log, lastrun_log, 0)
     run_logger.info("before upload")
     monkeypatch.setattr(main, "sftp_run", _fake_sftp_run())
-    sftp_target = main.SftpTarget(
-        name="default",
-        client="alice",
-        server="example.com",
-        port=22,
-        key_file=main.Path("/keys/id_ed25519"),
-        remote_root="backup",
-        writable=True,
-    )
 
-    main.upload_log(
-        run_log, "run.txt", sftp_target, tmp_path / "kh", "host", run_logger
+    uploaded = main.upload_logs(
+        run_log,
+        "run.txt",
+        [_upload_target(writable=True)],
+        tmp_path / "kh",
+        "host",
+        run_logger,
     )
     run_logger.info("after upload")
 
+    assert uploaded is True
     assert not run_log.exists()
     assert "after upload" in persistent_log.read_text()
 
@@ -1683,7 +1680,7 @@ def test_sftp_run_reads_commands_as_a_batch_file(monkeypatch, tmp_path):
     assert captured["cmd"][1:3] == ["-b", "-"]
 
 
-def test_upload_log_creates_logs_directory_and_ignores_symlink_failures(
+def test_upload_log_over_sftp_creates_logs_directory_and_ignores_symlink_failures(
     monkeypatch, tmp_path
 ):
     commands = []
@@ -1696,16 +1693,11 @@ def test_upload_log_creates_logs_directory_and_ignores_symlink_failures(
     run_log = tmp_path / "run.txt"
     run_log.write_text("log\n")
 
-    uploaded = main.upload_log(
-        run_log,
-        "run.txt",
-        _upload_target(writable=True),
-        tmp_path / "kh",
-        "host",
-        _CapturingRunLogger(),
+    error = main.upload_log_over_sftp(
+        run_log, "run.txt", _upload_target(writable=True), tmp_path / "kh", "host"
     )
 
-    assert uploaded is True
+    assert error is None
     lines = commands[0].splitlines()
     assert lines[0] == '-mkdir "backup/logs"'
     assert lines[1] == f'put "{run_log}" "backup/logs/"'
@@ -1713,7 +1705,99 @@ def test_upload_log_creates_logs_directory_and_ignores_symlink_failures(
     assert lines[3].startswith("-symlink ")
 
 
-def test_upload_log_reports_failure_and_keeps_run_log(monkeypatch, tmp_path):
+def test_upload_log_over_sftp_skips_symlink_when_not_writable(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_sftp_run(command_text, *args, **kwargs):
+        commands.append(command_text)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(main, "sftp_run", fake_sftp_run)
+
+    main.upload_log_over_sftp(
+        tmp_path / "run.txt",
+        "run.txt",
+        _upload_target(writable=False),
+        tmp_path / "kh",
+        "host",
+    )
+
+    assert len(commands[0].splitlines()) == 2
+
+
+def test_copy_log_locally_copies_log_and_points_latest_at_it(tmp_path):
+    run_log = tmp_path / "run.txt"
+    run_log.write_text("log\n")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    logs_dir = storage / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "duplicacy.host.latest.txt").write_text("stale\n")
+
+    error = main.copy_log_locally(
+        run_log, "run.txt", main.LocalTarget("local", storage), "host"
+    )
+
+    assert error is None
+    assert (logs_dir / "run.txt").read_text() == "log\n"
+    assert (logs_dir / "duplicacy.host.latest.txt").read_text() == "log\n"
+
+
+def test_copy_log_locally_fails_when_storage_directory_is_missing(tmp_path):
+    run_log = tmp_path / "run.txt"
+    run_log.write_text("log\n")
+    storage = tmp_path / "unmounted"
+
+    error = main.copy_log_locally(
+        run_log, "run.txt", main.LocalTarget("local", storage), "host"
+    )
+
+    assert error is not None
+    assert not storage.exists()
+
+
+def test_upload_logs_uploads_to_every_target(monkeypatch, tmp_path):
+    sftp_calls = []
+
+    def fake_sftp_run(command_text, user, host, *args, **kwargs):
+        sftp_calls.append(host)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(main, "sftp_run", fake_sftp_run)
+    run_log = tmp_path / "run.txt"
+    run_log.write_text("log\n")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    second_sftp = main.SftpTarget(
+        name="offsite",
+        client="bob",
+        server="offsite.example.com",
+        port=22,
+        key_file=main.Path("/keys/id_ed25519"),
+        remote_root="backup",
+        writable=True,
+    )
+
+    uploaded = main.upload_logs(
+        run_log,
+        "run.txt",
+        [
+            main.LocalTarget("local", storage),
+            _upload_target(writable=True),
+            second_sftp,
+        ],
+        tmp_path / "kh",
+        "host",
+        _CapturingRunLogger(),
+    )
+
+    assert uploaded is True
+    assert (storage / "logs" / "run.txt").read_text() == "log\n"
+    assert sftp_calls == ["example.com", "offsite.example.com"]
+    assert not run_log.exists()
+
+
+def test_upload_logs_continues_past_failure_and_keeps_run_log(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main,
         "sftp_run",
@@ -1721,12 +1805,14 @@ def test_upload_log_reports_failure_and_keeps_run_log(monkeypatch, tmp_path):
     )
     run_log = tmp_path / "run.txt"
     run_log.write_text("log\n")
+    storage = tmp_path / "storage"
+    storage.mkdir()
     run_logger = _CapturingRunLogger()
 
-    uploaded = main.upload_log(
+    uploaded = main.upload_logs(
         run_log,
         "run.txt",
-        _upload_target(writable=False),
+        [_upload_target(writable=False), main.LocalTarget("local", storage)],
         tmp_path / "kh",
         "host",
         run_logger,
@@ -1734,5 +1820,21 @@ def test_upload_log_reports_failure_and_keeps_run_log(monkeypatch, tmp_path):
 
     assert uploaded is False
     assert run_log.exists()
+    assert (storage / "logs" / "run.txt").exists()
     assert "dest open: Failure" in run_logger.errors[0]
-    assert not any("log uploaded" in message for message in run_logger.messages)
+    assert any("'local'" in message for message in run_logger.messages)
+
+
+def test_unique_log_targets_drops_repeated_destinations(tmp_path):
+    targets = main.unique_log_targets(
+        [
+            _upload_target(writable=False),
+            main.LocalTarget("local", tmp_path / "storage"),
+            main.LocalTarget("local", tmp_path / "x" / ".." / "storage"),
+            _upload_target(writable=True),
+        ]
+    )
+
+    assert len(targets) == 2
+    assert targets[0].writable is True
+    assert isinstance(targets[1], main.LocalTarget)

@@ -24,7 +24,9 @@ For each configured backup directory, it:
 - Prunes each destination after its backup/copy succeeds, where pruning is permitted.
 - Logs to a per-run file, a persistent per-client log, and a "lastrun" log, and
   reports start/failure/success/log-tail events to healthchecks.io.
-- Uploads the per-run log to the last sftp destination touched.
+- Uploads the per-run log to the `logs/` directory of every destination, local
+  or sftp, and (where pruning is permitted) points a
+  `duplicacy.<host>.latest.txt` symlink at it.
 
 A failure on one destination or backup directory doesn't abort the run — processing
 continues with the rest, and the final log-upload/ping always happens.
