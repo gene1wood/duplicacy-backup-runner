@@ -181,7 +181,7 @@ def test_resolve_upgrade_command_uses_pipx_with_its_home_and_bin_dir(fake_venv):
     assert setup.resolve_upgrade_command() == [
         "/usr/bin/env",
         f"PIPX_HOME={fake_venv.parent.parent}",
-        "PIPX_BIN_DIR=/usr/bin",
+        f"PIPX_BIN_DIR={main.Path('/usr/bin')}",
         "/usr/bin/pipx",
         "upgrade",
         "--quiet",
