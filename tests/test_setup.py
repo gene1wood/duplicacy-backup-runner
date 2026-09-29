@@ -546,3 +546,128 @@ def test_prompt_encryption_choice_reuses_existing_rsa_key(monkeypatch, tmp_path)
 
     assert encrypted is True
     assert rsa_public_key == existing
+
+
+def test_confirm_backup_directory_accepts_existing_directory(monkeypatch, tmp_path):
+    def fail_confirm(*args, **kwargs):
+        raise AssertionError(f"unexpected confirm prompt: {args}")
+
+    monkeypatch.setattr(setup, "confirm", fail_confirm)
+
+    assert setup.confirm_backup_directory(tmp_path) is True
+
+
+def test_confirm_backup_directory_creates_missing_directory_when_confirmed(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(setup, "confirm", lambda *a, **k: True)
+    directory = tmp_path / "new" / "backup"
+
+    assert setup.confirm_backup_directory(directory) is True
+    assert directory.is_dir()
+
+
+def test_confirm_backup_directory_rejects_missing_directory_when_declined(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(setup, "confirm", lambda *a, **k: False)
+    directory = tmp_path / "typo"
+
+    assert setup.confirm_backup_directory(directory) is False
+    assert not directory.exists()
+
+
+def test_confirm_backup_directory_rejects_file(tmp_path):
+    path = tmp_path / "file"
+    path.write_text("")
+
+    assert setup.confirm_backup_directory(path) is False
+
+
+def test_prompt_for_backup_directories_collects_until_blank(monkeypatch, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    answers = iter([str(first), str(tmp_path / "typo"), str(first), str(second), ""])
+    monkeypatch.setattr(setup, "ask", lambda *a, **k: next(answers))
+    monkeypatch.setattr(setup, "confirm", lambda *a, **k: False)
+
+    assert setup.prompt_for_backup_directories() == [first, second]
+    assert next(answers, None) is None
+
+
+def test_known_hosts_has_host_matches_plain_entries(tmp_path):
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text(
+        "# comment\n"
+        "Example.com,10.0.0.1 ssh-ed25519 AAAA\n"
+        "[other.example]:2222 ssh-ed25519 BBBB\n"
+    )
+
+    assert setup.known_hosts_has_host(known_hosts, "example.com", 22) is True
+    assert setup.known_hosts_has_host(known_hosts, "other.example", 2222) is True
+    assert setup.known_hosts_has_host(known_hosts, "other.example", 22) is False
+    assert setup.known_hosts_has_host(known_hosts, "example.com", 2222) is False
+
+
+def test_known_hosts_has_host_matches_hashed_entries(tmp_path):
+    known_hosts = tmp_path / "known_hosts"
+    salt = b"0123456789abcdefghij"
+    digest = setup.hmac.new(salt, b"[example.com]:2222", "sha1").digest()
+    known_hosts.write_text(
+        f"|1|{setup.base64.b64encode(salt).decode()}|"
+        f"{setup.base64.b64encode(digest).decode()} ssh-ed25519 AAAA\n"
+        "|1|not-base64|garbage ssh-ed25519 BBBB\n"
+    )
+
+    assert setup.known_hosts_has_host(known_hosts, "example.com", 2222) is True
+    assert setup.known_hosts_has_host(known_hosts, "example.com", 22) is False
+
+
+def test_known_hosts_has_host_false_when_file_missing(tmp_path):
+    assert setup.known_hosts_has_host(tmp_path / "missing", "example.com", 22) is False
+
+
+def test_ensure_server_in_known_hosts_skips_prompt_when_host_known(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "keys" / "known_hosts").write_text("example.com ssh-ed25519 AAAA\n")
+
+    def fail_ask_multiline(*args, **kwargs):
+        raise AssertionError("known_hosts entries must not be asked for")
+
+    monkeypatch.setattr(setup, "ask_multiline", fail_ask_multiline)
+
+    result = setup.ensure_server_in_known_hosts(
+        "sftp://client@example.com/backup", tmp_path, None, tmp_path / "config.yaml"
+    )
+
+    assert result is None
+
+
+def test_ensure_server_in_known_hosts_appends_to_existing_file_entries(
+    monkeypatch, tmp_path
+):
+    known_hosts = tmp_path / "keys" / "known_hosts"
+    known_hosts.parent.mkdir()
+    known_hosts.write_text("# hand managed\nfirst.example ssh-ed25519 AAAA\n")
+    monkeypatch.setattr(
+        setup,
+        "ask_multiline",
+        lambda *a, **k: "[second.example]:2222 ssh-ed25519 BBBB\n",
+    )
+
+    result = setup.ensure_server_in_known_hosts(
+        "sftp://client@second.example:2222/backup",
+        tmp_path,
+        None,
+        tmp_path / "config.yaml",
+    )
+
+    assert result == (
+        "first.example ssh-ed25519 AAAA\n[second.example]:2222 ssh-ed25519 BBBB\n"
+    )
+    assert setup.known_hosts_has_host(known_hosts, "first.example", 22)
+    assert setup.known_hosts_has_host(known_hosts, "second.example", 2222)

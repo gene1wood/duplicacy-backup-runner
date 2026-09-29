@@ -46,11 +46,16 @@ duplicacy-backup-runner setup
 This provisions `<duplicacy_basedir>`, downloads the `duplicacy` binary, walks
 you through SSH keys and sync/RSA encryption, runs `duplicacy init`, fetches
 `.duplicacy/filters`, writes/updates `config.yaml`, and installs a systemd
-timer or `/etc/cron.d` entry. Run it again to add another backup directory or
-destination to an existing setup. If the backup directory already has a
-`.duplicacy/preferences`, its default destination's storage URL, encryption,
-SSH key and password are reused rather than prompted for, and `duplicacy init`
-is skipped.
+timer or `/etc/cron.d` entry. It asks for backup directories one at a time until
+you enter a blank line (or pass `--backup-directory` once per directory), and
+each is set up in turn. A backup directory that doesn't exist is only created if
+you confirm it, so a typo isn't provisioned as a new, empty directory. Run it
+again to add another backup directory or destination to an existing setup. If a
+backup directory already has a `.duplicacy/preferences`, its default
+destination's storage URL, encryption, SSH key and password are reused rather
+than prompted for, and `duplicacy init` is skipped. You're only asked for an sftp
+server's `known_hosts` entries if `<duplicacy_basedir>/keys/known_hosts` doesn't
+already have one for that server (hashed entries are recognized).
 
 ## Configuration
 

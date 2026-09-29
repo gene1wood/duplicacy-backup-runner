@@ -593,6 +593,60 @@ def test_setup_then_run_backs_up_successfully(tmp_path, monkeypatch, local_http_
     assert any((storage / "snapshots").iterdir())
 
 
+def test_setup_provisions_multiple_backup_directories(tmp_path, monkeypatch):
+    """Runs setup with two --backup-directory options: each gets its own
+    destination prompt and duplicacy init, and both end up in config.yaml's
+    backup_directories."""
+    repos = [tmp_path / "repo1", tmp_path / "repo2"]
+    storages = [tmp_path / "storage1", tmp_path / "storage2"]
+    target = tmp_path / "target"
+    target.mkdir()
+    for repo, storage in zip(repos, storages):
+        repo.mkdir()
+        storage.mkdir()
+        (repo / "data").symlink_to(target)
+
+    duplicacy_basedir = tmp_path / "duplicacy"
+    _install_duplicacy(duplicacy_basedir)
+    config_path = tmp_path / "config.yaml"
+
+    asks = iter(
+        [
+            str(storages[0]),
+            "",
+            str(storages[1]),
+            "",
+            "00000000-0000-0000-0000-000000000000",
+        ]
+    )
+    confirms = iter([False, False, False, False])  # not sftp; not encrypted (x2)
+    monkeypatch.setattr(setup, "ask", lambda *a, **k: next(asks))
+    monkeypatch.setattr(setup, "confirm", lambda *a, **k: next(confirms))
+    monkeypatch.setattr(setup, "running_as_root", lambda: False)
+
+    exit_code = main.main(
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--duplicacy-basedir",
+            str(duplicacy_basedir),
+            "--backup-directory",
+            str(repos[0]),
+            "--backup-directory",
+            str(repos[1]),
+        ]
+    )
+
+    assert exit_code == 0
+    assert next(asks, None) is None
+    for repo, storage in zip(repos, storages):
+        assert (repo / ".duplicacy" / "preferences").is_file()
+        assert (storage / "chunks").is_dir()
+    raw_config = yaml.safe_load(config_path.read_text())
+    assert raw_config["backup_directories"] == [str(repo) for repo in repos]
+
+
 def test_setup_reuses_existing_preferences_without_prompting(tmp_path, monkeypatch):
     """Runs setup against a repository that already has
     .duplicacy/preferences (encrypted, password already set): the storage

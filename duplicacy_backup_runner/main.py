@@ -1605,7 +1605,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     setup_parser.add_argument(
         "--duplicacy-basedir", type=Path, default=DEFAULT_DUPLICACY_BASEDIR
     )
-    setup_parser.add_argument("--backup-directory", type=Path, default=None)
+    setup_parser.add_argument(
+        "--backup-directory",
+        dest="backup_directories",
+        type=Path,
+        action="append",
+        default=None,
+        help="A backup directory to provision; repeat for several. Prompted for "
+        "if omitted",
+    )
     setup_parser.add_argument("--filters-url", default=None)
     setup_parser.add_argument("--duplicacy-version", default=None)
 

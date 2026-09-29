@@ -15,7 +15,10 @@ a circular import at module load time.
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
+import hashlib
+import hmac
 import os
 import shutil
 import subprocess
@@ -112,8 +115,51 @@ def check_setup_prerequisites() -> list[str]:
     return missing
 
 
-def prompt_for_backup_directory() -> Path:
-    return Path(ask("Backup directory to provision", type=click.Path()))
+def confirm_backup_directory(backup_directory: Path) -> bool:
+    """Checks that backup_directory exists, so a typo isn't silently
+    provisioned as a new, empty backup directory. A missing directory is
+    only created if the user confirms it.
+
+    :param backup_directory: The directory to check.
+    :type backup_directory: Path
+    :returns: True if backup_directory is (now) an existing directory.
+    :rtype: bool
+    """
+    if backup_directory.is_dir():
+        return True
+    if backup_directory.exists():
+        announce_error(f"{backup_directory} exists but isn't a directory")
+        return False
+    if not confirm(f"{backup_directory} doesn't exist. Create it", default=False):
+        return False
+    backup_directory.mkdir(parents=True)
+    return True
+
+
+def prompt_for_backup_directories() -> list[Path]:
+    """Prompts for backup directories, one at a time, until a blank answer
+    after at least one has been given, re-prompting for any that
+    confirm_backup_directory rejects.
+
+    :returns: The backup directories, without duplicates.
+    :rtype: list[Path]
+    """
+    directories: list[Path] = []
+    while True:
+        if directories:
+            answer = ask(
+                "Another backup directory to provision (blank to finish)",
+                default="",
+                show_default=False,
+                type=click.Path(),
+            )
+            if not answer:
+                return directories
+        else:
+            answer = ask("Backup directory to provision", type=click.Path())
+        directory = Path(answer)
+        if directory not in directories and confirm_backup_directory(directory):
+            directories.append(directory)
 
 
 def prompt_until_symlinks_present(backup_directory: Path) -> None:
@@ -193,8 +239,89 @@ def secure_key_file(key_file: Path) -> None:
     )
 
 
-def prompt_for_known_hosts_string() -> str:
-    return ask_multiline("known_hosts entries for the server (ssh-keyscan output)")
+def known_hosts_has_host(known_hosts_path: Path, server: str, port: int) -> bool:
+    """True if known_hosts_path has an entry for server:port, matching both
+    plain and hashed (HashKnownHosts, `|1|salt|hash`) host names the way ssh
+    does. Wildcard patterns and @cert-authority/@revoked lines aren't
+    matched.
+
+    :param known_hosts_path: The known_hosts file to search; a missing file
+        has no entries.
+    :type known_hosts_path: Path
+    :param server: The sftp server's hostname.
+    :type server: str
+    :param port: The sftp server's port.
+    :type port: int
+    :rtype: bool
+    """
+    host = server.lower() if port == 22 else f"[{server.lower()}]:{port}"
+    try:
+        lines = known_hosts_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0].startswith(("#", "@")):
+            continue
+        if fields[0].startswith("|1|"):
+            try:
+                _, _, salt, digest = fields[0].split("|")
+                expected = base64.b64decode(digest)
+                actual = hmac.new(
+                    base64.b64decode(salt), host.encode(), hashlib.sha1
+                ).digest()
+            except ValueError:
+                continue
+            if hmac.compare_digest(actual, expected):
+                return True
+        elif host in fields[0].lower().split(","):
+            return True
+    return False
+
+
+def ensure_server_in_known_hosts(
+    storage_url: str,
+    duplicacy_basedir: Path,
+    known_hosts_string: str | None,
+    config_path: Path,
+) -> str | None:
+    """Prompts for storage_url's server's known_hosts entries, unless
+    <duplicacy_basedir>/keys/known_hosts already has one for it, and writes
+    them to that file with ensure_known_hosts. New entries are appended to
+    known_hosts_string or, if that's not set, to the file's existing
+    entries, so none are dropped when the file is rewritten.
+
+    :param storage_url: The sftp storage URL whose server must be trusted.
+    :type storage_url: str
+    :param duplicacy_basedir: Root of the Duplicacy install.
+    :type duplicacy_basedir: Path
+    :param known_hosts_string: known_hosts entries gathered so far (from
+        config.yaml or earlier backup directories), or None.
+    :type known_hosts_string: str | None
+    :param config_path: The config.yaml known_hosts_string will be saved to.
+    :type config_path: Path
+    :returns: known_hosts_string, with any newly entered entries appended.
+    :rtype: str | None
+    """
+    known_hosts_path = duplicacy_basedir / "keys" / "known_hosts"
+    _, server, port = main.parse_sftp_target(storage_url)
+    if known_hosts_has_host(known_hosts_path, server, port):
+        announce(f"Using the existing {server} entry in {known_hosts_path}", fg="cyan")
+        return known_hosts_string
+    if known_hosts_string is None and known_hosts_path.is_file():
+        existing_lines = [
+            line
+            for line in known_hosts_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        known_hosts_string = "".join(f"{line}\n" for line in existing_lines)
+    known_hosts_string = (known_hosts_string or "") + ask_multiline(
+        f"known_hosts entries for {server} (ssh-keyscan output)"
+    )
+    main.ensure_known_hosts(
+        duplicacy_basedir, known_hosts_string, config_path, ConsoleAnnouncer()
+    )
+    return known_hosts_string
 
 
 def openssl_is_version_3() -> bool:
@@ -461,7 +588,7 @@ def write_config(config_path: Path, raw_config: dict) -> None:
 
 def prompt_and_write_config(
     config_path: Path,
-    backup_directory: Path,
+    backup_directories: list[Path],
     duplicacy_basedir: Path,
     known_hosts_string: str | None,
     filters_url: str | None,
@@ -477,7 +604,8 @@ def prompt_and_write_config(
         raw_config["known_hosts_string"] = known_hosts_string
     if filters_url:
         raw_config["filters_url"] = filters_url
-    raw_config = merge_backup_directory_into_config(raw_config, backup_directory)
+    for backup_directory in backup_directories:
+        raw_config = merge_backup_directory_into_config(raw_config, backup_directory)
     write_config(config_path, raw_config)
     announce(f"Wrote {config_path}")
     return raw_config
@@ -698,45 +826,50 @@ def install_windows_scheduled_task(config_path: Path, working_directory: Path) -
 
 
 def print_first_run_instructions(
-    duplicacy_binary: Path, backup_directory: Path
+    duplicacy_binary: Path, backup_directories: list[Path]
 ) -> None:
     click.secho("\nSetup complete.", fg="green", bold=True)
     click.echo("To do a dry run to see what would be backed up:")
-    click.echo(f"  cd {backup_directory}")
-    click.echo(f"  {duplicacy_binary} backup -stats -dry-run")
+    for backup_directory in backup_directories:
+        click.echo(f"  cd {backup_directory}")
+        click.echo(f"  {duplicacy_binary} backup -stats -dry-run")
 
 
-def cmd_setup(args: argparse.Namespace) -> int:
-    """Interactively provisions this host:
-    installs the duplicacy binary, walks through SSH keys and encryption,
-    initializes the repository, fetches filters, writes config.yaml, and
-    installs a scheduled run. If backup_directory already has a
-    .duplicacy/preferences, its default destination's storage URL,
+def provision_backup_directory(
+    backup_directory: Path,
+    duplicacy_basedir: Path,
+    config_path: Path,
+    known_hosts_string: str | None,
+    filters_url: str | None,
+) -> str | None:
+    """Walks one backup directory through setup: symlinks, destination, SSH
+    key and known_hosts, encryption, `duplicacy init`, the destination's
+    logs/ directory, filters, and preferences. If backup_directory already
+    has a .duplicacy/preferences, its default destination's storage URL,
     encryption, ssh_key_file and password are reused instead of prompted
     for (only ones missing from it are asked), and `duplicacy init` is
-    skipped."""
-    missing = check_setup_prerequisites()
-    if missing:
-        announce_error(f"Missing required executables: {', '.join(missing)}")
-        return 1
+    skipped.
 
-    duplicacy_basedir = args.duplicacy_basedir
-    main.provision_basedir(
-        duplicacy_basedir, duplicacy_basedir / "logs", ConsoleAnnouncer()
-    )
-    main.provision_duplicacy_binary(
-        main.duplicacy_binary_path(duplicacy_basedir),
-        args.duplicacy_version or main.DEFAULT_DUPLICACY_VERSION,
-        None,
-        ConsoleAnnouncer(),
-    )
-
-    backup_directory = args.backup_directory or prompt_for_backup_directory()
-    backup_directory.mkdir(parents=True, exist_ok=True)
+    :param backup_directory: An existing directory to provision.
+    :type backup_directory: Path
+    :param duplicacy_basedir: Root of the Duplicacy install.
+    :type duplicacy_basedir: Path
+    :param config_path: The config.yaml setup writes.
+    :type config_path: Path
+    :param known_hosts_string: known_hosts entries gathered so far, or None.
+    :type known_hosts_string: str | None
+    :param filters_url: URL to fetch .duplicacy/filters from, or None to
+        prompt for one.
+    :type filters_url: str | None
+    :returns: known_hosts_string, with any entries entered for this backup
+        directory's server appended.
+    :rtype: str | None
+    :raises SystemExit: If `duplicacy init` fails.
+    """
+    announce(f"\nSetting up backup directory {backup_directory}", fg="cyan")
     prompt_until_symlinks_present(backup_directory)
 
     client = main.short_hostname()
-    config_path = args.config or main.default_config_path()
     duplicacy_binary = main.duplicacy_binary_path(duplicacy_basedir)
     existing = read_existing_default_entry(backup_directory)
     if existing is None:
@@ -757,7 +890,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # duplicacy set below
     new_ssh_key_file: Path | None = None
     ssh_key_file: Path | None = None
-    known_hosts_string: str | None = None
     known_hosts_path = duplicacy_basedir / "keys" / "known_hosts"
     if not main.is_local_storage(storage_url):
         if existing is not None and existing.ssh_key_file is not None:
@@ -769,9 +901,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
             ssh_key_file = new_ssh_key_file = prompt_for_ssh_key_file(
                 client, duplicacy_basedir / "keys"
             )
-        known_hosts_string = prompt_for_known_hosts_string()
-        known_hosts_path = main.ensure_known_hosts(
-            duplicacy_basedir, known_hosts_string, config_path, ConsoleAnnouncer()
+        known_hosts_string = ensure_server_in_known_hosts(
+            storage_url, duplicacy_basedir, known_hosts_string, config_path
         )
 
     new_password: str | None = None
@@ -791,12 +922,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
             ssh_key_file,
             ConsoleAnnouncer(),
         ):
-            return 1
+            raise SystemExit(1)
     elif existing.encrypted and not existing.password:
         new_password = prompt_storage_password(True)
 
     create_destination_logs_directory(storage_url, ssh_key_file, known_hosts_path)
-    prompt_and_fetch_filters(backup_directory, args.filters_url)
+    prompt_and_fetch_filters(backup_directory, filters_url)
 
     storage_name = existing.name if existing is not None else None
     if new_ssh_key_file is not None:
@@ -811,10 +942,61 @@ def cmd_setup(args: argparse.Namespace) -> int:
         duplicacy_set(
             duplicacy_binary, backup_directory, "password", new_password, storage_name
         )
+    return known_hosts_string
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Interactively provisions this host: installs the duplicacy binary,
+    asks for one or more backup directories (checking each exists), sets
+    each up with provision_backup_directory, writes config.yaml, and
+    installs a scheduled run."""
+    missing = check_setup_prerequisites()
+    if missing:
+        announce_error(f"Missing required executables: {', '.join(missing)}")
+        return 1
+
+    duplicacy_basedir = args.duplicacy_basedir
+    main.provision_basedir(
+        duplicacy_basedir, duplicacy_basedir / "logs", ConsoleAnnouncer()
+    )
+    main.provision_duplicacy_binary(
+        main.duplicacy_binary_path(duplicacy_basedir),
+        args.duplicacy_version or main.DEFAULT_DUPLICACY_VERSION,
+        None,
+        ConsoleAnnouncer(),
+    )
+
+    if args.backup_directories:
+        backup_directories = list(dict.fromkeys(args.backup_directories))
+        for backup_directory in backup_directories:
+            if not confirm_backup_directory(backup_directory):
+                announce_error(f"Backup directory {backup_directory} doesn't exist")
+                return 1
+    else:
+        backup_directories = prompt_for_backup_directories()
+
+    config_path = args.config or main.default_config_path()
+    known_hosts_string = load_existing_config_dict(config_path).get(
+        "known_hosts_string"
+    )
+    if known_hosts_string:
+        # So known_hosts_has_host sees what config.yaml already trusts even
+        # if no scheduled run has written it out yet
+        main.ensure_known_hosts(
+            duplicacy_basedir, known_hosts_string, config_path, ConsoleAnnouncer()
+        )
+    for backup_directory in backup_directories:
+        known_hosts_string = provision_backup_directory(
+            backup_directory,
+            duplicacy_basedir,
+            config_path,
+            known_hosts_string,
+            args.filters_url,
+        )
 
     prompt_and_write_config(
         config_path,
-        backup_directory,
+        backup_directories,
         duplicacy_basedir,
         known_hosts_string,
         args.filters_url,
@@ -826,5 +1008,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         exec_command = build_exec_command(resolve_console_script_path(), config_path)
         install_scheduled_run(exec_command)
 
-    print_first_run_instructions(duplicacy_binary, backup_directory)
+    print_first_run_instructions(
+        main.duplicacy_binary_path(duplicacy_basedir), backup_directories
+    )
     return 0
